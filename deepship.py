@@ -75,8 +75,28 @@ Requirements:
     pip install requests beautifulsoup4
 
 Config (env vars, or a .env file sitting next to this script):
-    GROQ_API_KEY=gsk_...              (required)
-    GROQ_MODEL=llama-3.3-70b-versatile   (optional, this is the default)
+    GROQ_API_KEY=gsk_...                  (at least one provider key required)
+    GROQ_MODEL=openai/gpt-oss-120b           (optional -- pins Groq's FIRST-tried
+                                               model; Groq still falls back through
+                                               its other models, then other
+                                               providers, if that one's unavailable)
+
+    Every LLM call in this script (link triage, pass 1/2/3) goes through a
+    provider FALLBACK CHAIN, not just Groq. If Groq's free tier runs out
+    (or any other error keeps happening), the very next call automatically
+    moves on to the next provider below that has a key configured -- same
+    prompt, no restart needed. Add whichever of these you have keys for;
+    unset ones are just skipped:
+        CEREBRAS_API_KEY / CEREBRAS_MODEL     (default: llama-3.3-70b)
+        TOGETHER_API_KEY / TOGETHER_MODEL     (default: meta-llama/Llama-3.3-70B-Instruct-Turbo)
+        FIREWORKS_API_KEY / FIREWORKS_MODEL   (default: accounts/fireworks/models/llama-v3p3-70b-instruct)
+        OPENROUTER_API_KEY / OPENROUTER_MODEL (default: meta-llama/llama-3.3-70b-instruct)
+        DEEPSEEK_API_KEY / DEEPSEEK_MODEL     (default: deepseek-chat)
+        OPENAI_API_KEY / OPENAI_MODEL         (default: gpt-4o-mini)
+    That's also the fallback order (Groq first, OpenAI last -- roughly
+    cheapest/most-generous-free-tier to most expensive). Use the GUI's
+    "Check API Key" button, or the CLI's startup check, to see exactly
+    which providers were detected.
 
 Usage:
     python3 deepship.py                          # launches the GUI
@@ -133,7 +153,7 @@ ENV_DEBUG = _load_dotenv_if_present()
 # ---------------------------------------------------------------------------
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "PASTE_YOUR_GROQ_API_KEY_HERE")
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
 
 
@@ -252,7 +272,10 @@ class GroqRateLimiter:
                 self.min_interval = max(self.base_interval, self.min_interval - GROQ_COOLDOWN_STEP)
 
 
-GROQ_RATE_LIMITER = GroqRateLimiter()
+GROQ_RATE_LIMITER = GroqRateLimiter()  # legacy name kept in case anything external
+                                        # imports it; the pipeline itself now uses a
+                                        # separate GroqRateLimiter per provider (see
+                                        # _rate_limiter_for() below)
 
 
 # ---------------------------------------------------------------------------
@@ -260,14 +283,36 @@ GROQ_RATE_LIMITER = GroqRateLimiter()
 # ---------------------------------------------------------------------------
 
 class PayloadTooLargeError(Exception):
-    """Raised when Groq (or a proxy in front of it) rejects a request for
-    being too big -- HTTP 413, or a 400 whose body says as much (some
+    """Raised when a provider (or a proxy in front of it) rejects a request
+    for being too big -- HTTP 413, or a 400 whose body says as much (some
     providers report oversized-request as a 400 with a message instead of
-    a clean 413)."""
+    a clean 413). NOT provider-availability related, so this always bubbles
+    straight up to the caller (which re-chunks via SPLIT_LADDER) instead of
+    triggering a provider fallback -- a smaller chunk on the SAME provider
+    is the fix, not a different provider."""
     pass
 
 
 class GroqCallError(Exception):
+    """Base class for "this provider call didn't work" errors. Kept this
+    name for backwards compatibility with the rest of the pipeline, which
+    still catches GroqCallError everywhere -- QuotaExhaustedError and
+    ProviderAuthError below are both subclasses so existing except clauses
+    keep working unchanged."""
+    pass
+
+
+class QuotaExhaustedError(GroqCallError):
+    """A provider's retries all came back 429 -- reads as "tapped out"
+    (free-tier daily/rate quota) rather than a one-off blip. Triggers an
+    automatic fallback to the next configured provider."""
+    pass
+
+
+class ProviderAuthError(GroqCallError):
+    """A provider rejected the API key outright (401/403) -- missing,
+    invalid, or revoked. Also triggers fallback to the next provider,
+    since retrying the same bad key won't help."""
     pass
 
 
@@ -283,7 +328,264 @@ def _check_stop(stop_flag):
 
 
 # ---------------------------------------------------------------------------
-# Low-level Groq call
+# Multi-provider LLM config + auto-fallback
+# ---------------------------------------------------------------------------
+# Every one of these speaks the same OpenAI-style POST /chat/completions
+# request/response shape Groq does, so one low-level caller can drive all
+# of them. Only providers with an API key actually set (env var or .env)
+# become part of the live fallback chain -- add nothing and it behaves
+# exactly like before (Groq only); drop in e.g. CEREBRAS_API_KEY and it's
+# used automatically the moment Groq's free tier taps out, no restart.
+
+LLM_PROVIDERS = [
+    {
+        # Groq deprecated its old Llama chat models (llama-3.3-70b-versatile,
+        # llama-3.1-8b-instant) for free/developer tier in mid-2026 in favor
+        # of these -- gpt-oss and Qwen3.6 are the current fast/free-tier picks.
+        "name": "groq",
+        "endpoint": "https://api.groq.com/openai/v1/chat/completions",
+        "api_key_env": "GROQ_API_KEY",
+        "model_env": "GROQ_MODEL",
+        "models": [
+            "openai/gpt-oss-120b",
+            "openai/gpt-oss-20b",
+            "qwen/qwen3.6-27b",
+            "moonshotai/kimi-k2-instruct-0905",
+            "llama-3.3-70b-versatile",  # kept as a last-ditch try in case your
+                                         # account still has legacy access
+        ],
+    },
+    {
+        "name": "cerebras",
+        "endpoint": "https://api.cerebras.ai/v1/chat/completions",
+        "api_key_env": "CEREBRAS_API_KEY",
+        "model_env": "CEREBRAS_MODEL",
+        "models": ["llama-3.3-70b", "gpt-oss-120b", "qwen-3-32b"],
+    },
+    {
+        "name": "together",
+        "endpoint": "https://api.together.xyz/v1/chat/completions",
+        "api_key_env": "TOGETHER_API_KEY",
+        "model_env": "TOGETHER_MODEL",
+        "models": [
+            "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+            "openai/gpt-oss-120b",
+            "Qwen/Qwen2.5-72B-Instruct-Turbo",
+        ],
+    },
+    {
+        "name": "fireworks",
+        "endpoint": "https://api.fireworks.ai/inference/v1/chat/completions",
+        "api_key_env": "FIREWORKS_API_KEY",
+        "model_env": "FIREWORKS_MODEL",
+        "models": [
+            "accounts/fireworks/models/llama-v3p3-70b-instruct",
+            "accounts/fireworks/models/gpt-oss-120b",
+            "accounts/fireworks/models/qwen2p5-72b-instruct",
+        ],
+    },
+    {
+        # OpenRouter fronts dozens of providers behind one key -- these are
+        # its free-tier-friendly, non-gated model slugs.
+        "name": "openrouter",
+        "endpoint": "https://openrouter.ai/api/v1/chat/completions",
+        "api_key_env": "OPENROUTER_API_KEY",
+        "model_env": "OPENROUTER_MODEL",
+        "models": [
+            "openai/gpt-oss-120b",
+            "meta-llama/llama-3.3-70b-instruct",
+            "qwen/qwen-2.5-72b-instruct",
+        ],
+    },
+    {
+        "name": "deepseek",
+        "endpoint": "https://api.deepseek.com/chat/completions",
+        "api_key_env": "DEEPSEEK_API_KEY",
+        "model_env": "DEEPSEEK_MODEL",
+        "models": ["deepseek-chat", "deepseek-reasoner"],
+    },
+    {
+        "name": "openai",
+        "endpoint": "https://api.openai.com/v1/chat/completions",
+        "api_key_env": "OPENAI_API_KEY",
+        "model_env": "OPENAI_MODEL",
+        "models": ["gpt-4o-mini", "gpt-4o", "gpt-oss-120b"],
+    },
+]
+
+_PROVIDER_RATE_LIMITERS = {}
+_PROVIDER_STATE_LOCK = threading.Lock()
+_ACTIVE_PROVIDERS = None        # lazily built; providers with a key actually set
+_DEAD_COMBOS = set()            # {(provider_name, model), ...} that failed hard this run
+_LAST_GOOD_COMBO = None         # sticky (provider_name, model) tried first, so we
+                                 # don't re-probe a dead combo on every single call
+
+
+def _rate_limiter_for(provider_name, model):
+    # Rate limits on most of these providers (Groq included) are tracked
+    # per MODEL, not just per account -- so each (provider, model) pair
+    # gets its own independent throttle/backoff state, not one shared per
+    # provider. That also means one model on a provider tapping out its
+    # quota doesn't slow down a different model on that same provider.
+    key = f"{provider_name}::{model}"
+    if key not in _PROVIDER_RATE_LIMITERS:
+        _PROVIDER_RATE_LIMITERS[key] = GroqRateLimiter()
+    return _PROVIDER_RATE_LIMITERS[key]
+
+
+def _models_for(provider):
+    """This provider's model list, with its <PROVIDER>_MODEL env override
+    (if set) pulled to the front -- so e.g. GROQ_MODEL=llama-3.3-70b-versatile
+    still works exactly like a manual pin, it's just now the FIRST thing
+    tried on that provider rather than the ONLY thing."""
+    models = list(provider["models"])
+    override = os.environ.get(provider["model_env"], "").strip()
+    if override:
+        models = [override] + [m for m in models if m != override]
+    return models
+
+
+def _build_candidate_chain():
+    """Flattens every configured provider's model list into one ordered
+    list of (provider, model) candidates: all of provider 1's models
+    (its override first, then its list in order), then all of provider
+    2's, etc. -- so a rate-limited/decommissioned MODEL falls back to the
+    next model on the SAME provider before ever moving to a different
+    provider."""
+    chain = []
+    for p in _configured_providers():
+        for m in _models_for(p):
+            chain.append((p, m))
+    return chain
+
+
+def _configured_providers():
+    """Returns LLM_PROVIDERS filtered down to the ones that actually have
+    an API key set right now, in fallback order (Groq first)."""
+    global _ACTIVE_PROVIDERS
+    active = []
+    for p in LLM_PROVIDERS:
+        key = os.environ.get(p["api_key_env"], "").strip()
+        if key and key not in ("PASTE_YOUR_GROQ_API_KEY_HERE", "paste"):
+            active.append(p)
+    _ACTIVE_PROVIDERS = active
+    return active
+
+
+_PASTED_KEY_ENV_VAR_NAMES = {p["api_key_env"] for p in LLM_PROVIDERS}
+
+
+def _detect_provider_for_raw_key(key):
+    """Best-effort guess at which provider a bare pasted key belongs to,
+    based on well-known key-prefix conventions. Returns a provider dict
+    from LLM_PROVIDERS, or None if the key doesn't match any known
+    pattern. (Together's keys are unprefixed hex -- told apart from a
+    random hex string only by length, so a genuinely unrecognizable line
+    is left alone rather than guessed wrong.)"""
+    k = key.strip()
+    if not k:
+        return None
+    prefix_map = [
+        ("gsk_", "groq"),
+        ("csk-", "cerebras"),
+        ("fw_", "fireworks"),
+        ("sk-or-", "openrouter"),
+    ]
+    for prefix, name in prefix_map:
+        if k.startswith(prefix):
+            return next(p for p in LLM_PROVIDERS if p["name"] == name)
+    if k.startswith("sk-proj-"):
+        return next(p for p in LLM_PROVIDERS if p["name"] == "openai")
+    if k.startswith("sk-"):
+        # OpenAI (classic) and DeepSeek both use a bare "sk-" prefix --
+        # DeepSeek keys run ~35-40 chars total, classic OpenAI keys ~51+.
+        want = "deepseek" if len(k) <= 45 else "openai"
+        return next(p for p in LLM_PROVIDERS if p["name"] == want)
+    if re.fullmatch(r"[0-9a-fA-F]{48,80}", k):
+        # Together.ai keys: long unprefixed hex string.
+        return next(p for p in LLM_PROVIDERS if p["name"] == "together")
+    return None
+
+
+def _assign_pasted_keys(raw_text):
+    """Parses pasted text -- one key per line, or KEY=VALUE .env-style
+    lines, in any mix and any order -- auto-detects each bare key's
+    provider by prefix, and assigns it straight into os.environ for this
+    process (nothing is written to disk, so a broken .env is a non-issue).
+    Returns (assigned, unrecognized): assigned is a list of
+    (provider_name, env_var_name) tuples in the order they were set;
+    unrecognized is the raw lines that didn't match anything."""
+    assigned = []
+    unrecognized = []
+    for raw_line in raw_text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].strip()
+
+        if "=" in line:
+            left, _, right = line.partition("=")
+            left = left.strip()
+            right = right.strip().strip('"').strip("'")
+            if left in _PASTED_KEY_ENV_VAR_NAMES and right:
+                os.environ[left] = right
+                provider = next(p for p in LLM_PROVIDERS if p["api_key_env"] == left)
+                assigned.append((provider["name"], left))
+                continue
+
+        provider = _detect_provider_for_raw_key(line)
+        if provider:
+            os.environ[provider["api_key_env"]] = line
+            assigned.append((provider["name"], provider["api_key_env"]))
+        else:
+            unrecognized.append(line)
+    return assigned, unrecognized
+
+
+def reset_provider_fallback_state():
+    """Call this at the start of a fresh run (CLI main(), GUI Start
+    button) so any (provider, model) combo marked dead on a previous run
+    gets a clean shot again -- useful if a daily quota reset, or you've
+    added/rotated a key mid-session."""
+    global _DEAD_COMBOS, _LAST_GOOD_COMBO
+    _DEAD_COMBOS = set()
+    _LAST_GOOD_COMBO = None
+
+
+def llm_provider_diagnostic():
+    """Human-readable status of every provider AND every model on it --
+    which env var the key comes from, whether a key is set, each model's
+    place in that provider's fallback order, and (mid-run) whether a given
+    (provider, model) combo is currently marked dead. Used by the GUI's
+    "Check API Key" button and the CLI's startup check, and folded into
+    the error raised when every combo in the whole chain has failed."""
+    lines = ["LLM provider + model fallback chain (tried in this order):"]
+    any_key = False
+    for p in LLM_PROVIDERS:
+        key = os.environ.get(p["api_key_env"], "").strip()
+        if key:
+            any_key = True
+            masked = key[:4] + "…" + key[-4:] if len(key) > 10 else "(short key)"
+            lines.append(f"  - {p['name']} [{p['api_key_env']}]: set ({masked})")
+            for m in _models_for(p):
+                dead_note = "  -- marked DEAD this run" if (p["name"], m) in _DEAD_COMBOS else ""
+                lines.append(f"      · {m}{dead_note}")
+        else:
+            lines.append(f"  - {p['name']} [{p['api_key_env']}]: not set")
+    if not any_key:
+        lines.append("")
+        lines.append("No provider API keys are set at all. At minimum, set GROQ_API_KEY "
+                      f"(env var or .env file at {ENV_DEBUG['env_path']}).")
+        lines.append("Optionally add any of: CEREBRAS_API_KEY, TOGETHER_API_KEY, "
+                      "FIREWORKS_API_KEY, OPENROUTER_API_KEY, DEEPSEEK_API_KEY, OPENAI_API_KEY "
+                      "-- deepship will fall back to whichever of those is configured "
+                      "automatically if Groq (or a given model on it) runs out.")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Low-level LLM call, with automatic provider fallback
 # ---------------------------------------------------------------------------
 
 def _looks_like_payload_too_large(status_code, body_text):
@@ -300,63 +602,218 @@ def _looks_like_payload_too_large(status_code, body_text):
     )
 
 
-def call_groq(messages, temperature=0.1, max_tokens=2000, model=None, log=None, max_retries=3):
-    """Mirrors call_groq()/callGroq() shape from alting_ua.py / splicer_core.py:
-    POST to GROQ_ENDPOINT, wait on the shared rate limiter first, retry on
-    429/transient network errors, and raise PayloadTooLargeError distinctly
-    so callers can escalate their chunking instead of just failing."""
+class ModelUnavailableError(GroqCallError):
+    """A specific MODEL was rejected -- decommissioned/deprecated, unknown
+    slug, or not enabled for this key/tier (a 400/404 whose body says as
+    much). Not a rate-limit issue, so no point retrying it: raised
+    immediately, and it moves straight to the next model in the chain
+    (same provider first, then the next provider) rather than burning
+    retries against a model that's never going to answer."""
+    pass
+
+
+def _looks_like_model_unavailable(status_code, body_text):
+    if status_code == 404:
+        return True
+    if status_code not in (400,):
+        return False
+    body_lower = (body_text or "").lower()
+    return any(
+        phrase in body_lower
+        for phrase in (
+            "model_decommissioned", "has been decommissioned", "has been deprecated",
+            "does not exist", "model not found", "unknown model", "invalid model",
+            "model_not_found", "not a valid model", "no longer supported",
+        )
+    )
+
+
+def _call_llm_once(provider, model, messages, temperature, max_tokens, log, max_retries):
+    """Does the actual HTTP call against ONE (provider, model) combo, with
+    the same retry-on-429/timeout/network-error behavior the original
+    single-provider call_groq() had. Raises ModelUnavailableError
+    immediately (no retries) if the model itself is rejected as unknown/
+    decommissioned; QuotaExhaustedError if every retry came back 429
+    (reads as "tapped out"); ProviderAuthError on a 401/403 (bad/missing
+    key); PayloadTooLargeError immediately on an oversized-payload
+    response (never retried -- the caller re-chunks); or a plain
+    GroqCallError for anything else that didn't recover within
+    max_retries."""
 
     def _log(msg):
         if log:
             log(msg)
 
-    if not GROQ_API_KEY:
-        raise GroqCallError(f"GROQ_API_KEY isn't set.\n{groq_key_diagnostic()}")
+    api_key = os.environ.get(provider["api_key_env"], "").strip()
+    if not api_key:
+        raise ProviderAuthError(f"{provider['name']}: no API key set ({provider['api_key_env']}).")
 
-    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {GROQ_API_KEY}"}
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
     payload = {
-        "model": model or GROQ_MODEL,
+        "model": model,
         "temperature": temperature,
         "max_tokens": max_tokens,
         "messages": messages,
     }
 
+    limiter = _rate_limiter_for(provider["name"], model)
     last_exc = None
+    saw_only_429 = True
     for attempt in range(1, max_retries + 1):
-        GROQ_RATE_LIMITER.wait_turn(_log)
+        limiter.wait_turn(_log)
         try:
-            resp = requests.post(GROQ_ENDPOINT, headers=headers, json=payload, timeout=GROQ_TIMEOUT_S)
+            resp = requests.post(provider["endpoint"], headers=headers, json=payload, timeout=GROQ_TIMEOUT_S)
         except requests.exceptions.Timeout:
-            last_exc = GroqCallError("Groq took too long to respond.")
-            _log(f"  ! Groq timeout (attempt {attempt}/{max_retries})")
+            saw_only_429 = False
+            last_exc = GroqCallError(f"{provider['name']}/{model}: took too long to respond.")
+            _log(f"  ! {provider['name']}/{model} timeout (attempt {attempt}/{max_retries})")
             continue
         except requests.exceptions.RequestException as exc:
-            last_exc = GroqCallError(f"Groq request failed: {exc}")
-            _log(f"  ! Groq network error (attempt {attempt}/{max_retries}): {exc}")
+            saw_only_429 = False
+            last_exc = GroqCallError(f"{provider['name']}/{model}: request failed: {exc}")
+            _log(f"  ! {provider['name']}/{model} network error (attempt {attempt}/{max_retries}): {exc}")
             time.sleep(1.5 * attempt)
             continue
 
+        if resp.status_code in (401, 403):
+            raise ProviderAuthError(f"{provider['name']}: HTTP {resp.status_code} -- {resp.text[:200]}")
+
+        if _looks_like_model_unavailable(resp.status_code, resp.text):
+            _log(f"  ! {provider['name']}/{model} -- model unavailable "
+                 f"(HTTP {resp.status_code}): {resp.text[:200]}")
+            raise ModelUnavailableError(f"{provider['name']}/{model}: HTTP {resp.status_code} -- {resp.text[:200]}")
+
         if resp.status_code == 429:
-            GROQ_RATE_LIMITER.note_rate_limited(_log)
-            last_exc = GroqCallError(f"Groq 429: {resp.text[:300]}")
+            limiter.note_rate_limited(_log)
+            last_exc = GroqCallError(f"{provider['name']}/{model} 429: {resp.text[:300]}")
+            _log(f"  ! {provider['name']}/{model} 429 (attempt {attempt}/{max_retries})")
             time.sleep(1.0 * attempt)
             continue
 
         if _looks_like_payload_too_large(resp.status_code, resp.text):
-            _log(f"  ! Groq says payload too large (HTTP {resp.status_code}) -- caller should clump smaller.")
+            _log(f"  ! {provider['name']}/{model} says payload too large (HTTP {resp.status_code}) "
+                 f"-- caller should clump smaller.")
             raise PayloadTooLargeError(resp.text[:300])
 
         if not resp.ok:
-            raise GroqCallError(f"Groq error: HTTP {resp.status_code} {resp.text[:400]}")
+            saw_only_429 = False
+            raise GroqCallError(f"{provider['name']}/{model} error: HTTP {resp.status_code} {resp.text[:400]}")
 
-        GROQ_RATE_LIMITER.note_success()
+        limiter.note_success()
         data = resp.json()
         choices = data.get("choices") or []
         if not choices:
             return ""
         return (choices[0].get("message", {}) or {}).get("content", "") or ""
 
-    raise last_exc or GroqCallError("Groq call failed after retries.")
+    if saw_only_429:
+        raise QuotaExhaustedError(
+            f"{provider['name']}/{model}: {max_retries} straight 429(s) -- looks like the free "
+            f"tier (or rate limit) for THIS MODEL is tapped out. {last_exc}"
+        )
+    raise last_exc or GroqCallError(f"{provider['name']}/{model}: call failed after retries.")
+
+
+def call_groq(messages, temperature=0.1, max_tokens=2000, model=None, log=None, max_retries=3):
+    """PUBLIC entry point every pass in this pipeline calls (kept the name
+    call_groq for backwards compatibility, but it no longer talks to Groq
+    exclusively, and no longer talks to just one model per provider).
+    Drives a flat chain of (provider, model) candidates built by
+    _build_candidate_chain(): every model on Groq first (gpt-oss-120b,
+    gpt-oss-20b, Qwen3.6-27b, ...), then every model on the next
+    configured provider, and so on. Whichever combo last worked is tried
+    first on the next call, so a live run doesn't re-probe dead combos
+    over and over.
+
+    If a call comes back as a rate-limit/quota tap-out
+    (QuotaExhaustedError), an unknown/decommissioned model
+    (ModelUnavailableError), a bad key (ProviderAuthError), or any other
+    unrecovered error, that exact (provider, model) combo is marked dead
+    for the rest of THIS run and the NEXT candidate in the chain is tried
+    automatically with the identical prompt -- same swap logic whether
+    that next candidate is a different model on the SAME provider (e.g.
+    Groq's gpt-oss-120b -> Groq's gpt-oss-20b) or a completely different
+    provider. Only raises once every configured (provider, model) combo
+    has failed.
+
+    PayloadTooLargeError is the one exception NOT treated as a fallback
+    trigger -- it bubbles straight up so the caller's SPLIT_LADDER logic
+    re-chunks and retries on the SAME combo, since a smaller chunk (not a
+    different model/provider) is the actual fix.
+
+    `model=` still works as a manual pin (e.g. --model from the CLI): it's
+    inserted at the front of EVERY provider's model list, so it's tried
+    first everywhere it might apply, but the rest of the chain is still
+    there as a fallback if that exact model name isn't valid on a given
+    provider."""
+
+    def _log(msg):
+        if log:
+            log(msg)
+
+    chain = _build_candidate_chain()
+    if model:
+        # A manual override applies provider-by-provider (a model name
+        # valid on Groq usually isn't a valid slug on OpenAI), so just
+        # prepend it once per provider rather than blindly to the whole
+        # flat chain.
+        chain = []
+        for p in _configured_providers():
+            models = [model] + [m for m in _models_for(p) if m != model]
+            chain.extend((p, m) for m in models)
+
+    if not chain:
+        raise GroqCallError(f"No LLM provider API keys are set.\n{llm_provider_diagnostic()}")
+
+    global _LAST_GOOD_COMBO
+    with _PROVIDER_STATE_LOCK:
+        sticky = _LAST_GOOD_COMBO
+
+    sticky_key = (sticky[0]["name"], sticky[1]) if sticky else None
+    if sticky and sticky_key not in _DEAD_COMBOS:
+        rest = [c for c in chain if (c[0]["name"], c[1]) != sticky_key]
+        order = [sticky] + rest
+    else:
+        order = chain
+
+    # Try not-yet-dead combos first; if literally everything is dead
+    # (every model on every provider has failed this run), give the whole
+    # chain one more shot anyway rather than failing outright -- a daily
+    # quota may have reset since it was marked dead.
+    live = [c for c in order if (c[0]["name"], c[1]) not in _DEAD_COMBOS]
+    order = live or order
+
+    errors = []
+    for i, (p, m) in enumerate(order):
+        try:
+            content = _call_llm_once(p, m, messages, temperature, max_tokens, log, max_retries)
+            with _PROVIDER_STATE_LOCK:
+                _LAST_GOOD_COMBO = (p, m)
+            _DEAD_COMBOS.discard((p["name"], m))
+            if i > 0:
+                _log(f"  -> fell back to {p['name']}/{m} for this call.")
+            return content
+        except PayloadTooLargeError:
+            raise
+        except (QuotaExhaustedError, ModelUnavailableError, ProviderAuthError, GroqCallError) as exc:
+            reason = "quota/rate-limit tapped out" if isinstance(exc, QuotaExhaustedError) else \
+                      "model unavailable/decommissioned" if isinstance(exc, ModelUnavailableError) else \
+                      "bad/missing API key" if isinstance(exc, ProviderAuthError) else "error"
+            _log(f"  ! {p['name']}/{m} unavailable ({reason}): {exc}")
+            _DEAD_COMBOS.add((p["name"], m))
+            errors.append(f"{p['name']}/{m}: {exc}")
+            if i < len(order) - 1:
+                nxt_p, nxt_m = order[i + 1]
+                same_provider = " (same provider, next model)" if nxt_p["name"] == p["name"] else ""
+                _log(f"  -> auto-falling back to {nxt_p['name']}/{nxt_m}{same_provider}...")
+            continue
+
+    raise GroqCallError(
+        "Every configured (provider, model) combo failed:\n" + "\n".join(errors) +
+        "\n\n" + llm_provider_diagnostic()
+    )
+
+
 
 
 def _extract_json(text):
@@ -1328,6 +1785,90 @@ def _run_gui():
     MAX_TEXT_PREVIEW_CHARS = 20000
     MAX_LOG_LINES = 2000
 
+    def _paste_keys_popup():
+        """Startup popup, shown before the main window: paste any number
+        of API keys, one per line (or KEY=VALUE .env-style lines), in
+        any order/provider mix. Each is auto-detected by its prefix and
+        assigned straight into os.environ for this process -- sidesteps
+        a broken .env entirely, since nothing is written to disk. Ends
+        by showing which provider(s) were detected before moving on."""
+        win = tk.Tk()
+        win.title("Deepship — Paste API Keys")
+        win.configure(bg=BG_DARK)
+        win.geometry("580x480")
+        win.resizable(False, False)
+        try:
+            win.eval("tk::PlaceWindow . center")
+        except tk.TclError:
+            pass
+
+        tk.Label(win, text="Paste your API key(s) below, one per line.",
+                 bg=BG_DARK, fg=FG_BRIGHT, font=("TkDefaultFont", 12, "bold")).pack(
+            anchor="w", padx=16, pady=(16, 4))
+        tk.Label(win,
+                 text="Any provider, any order, any mix — Groq, Cerebras, Together,\n"
+                      "Fireworks, OpenRouter, DeepSeek, OpenAI. Each key is\n"
+                      "auto-detected by its prefix and assigned to the right\n"
+                      "provider automatically. Plain KEY=value (.env-style) lines\n"
+                      "work too. Nothing is written to disk.",
+                 bg=BG_DARK, fg=FG_DIM, justify="left", font=("TkDefaultFont", 9)).pack(
+            anchor="w", padx=16, pady=(0, 10))
+
+        text = tk.Text(win, height=13, width=64, bg=BG_PANEL2, fg=FG_BRIGHT,
+                        insertbackground=FG_BRIGHT, bd=0, highlightthickness=1,
+                        highlightbackground=BORDER, font=("Consolas", 10), wrap="none")
+        text.pack(padx=16, pady=(0, 10), fill="both", expand=True)
+        text.focus_set()
+
+        result = {"assigned": [], "unrecognized": []}
+
+        def _do_continue(event=None):
+            raw = text.get("1.0", "end")
+            assigned, unrecognized = _assign_pasted_keys(raw)
+            result["assigned"] = assigned
+            result["unrecognized"] = unrecognized
+            _refresh_groq_env()
+            win.destroy()
+
+        def _do_skip():
+            win.destroy()
+
+        btns = tk.Frame(win, bg=BG_DARK)
+        btns.pack(fill="x", padx=16, pady=(0, 16))
+        tk.Button(btns, text="Continue →", command=_do_continue, bg=BG_PANEL2, fg=GREEN,
+                  activebackground="#242832", activeforeground=GREEN, bd=0, padx=14, pady=6,
+                  highlightthickness=1, highlightbackground=BORDER).pack(side="left")
+        tk.Button(btns, text="Skip (use existing / .env)", command=_do_skip, bg=BG_PANEL2, fg=FG_DIM,
+                  activebackground="#242832", activeforeground=FG_BRIGHT, bd=0, padx=14, pady=6,
+                  highlightthickness=1, highlightbackground=BORDER).pack(side="left", padx=8)
+
+        win.bind("<Control-Return>", _do_continue)
+        win.protocol("WM_DELETE_WINDOW", _do_skip)
+        win.mainloop()
+
+        assigned, unrecognized = result["assigned"], result["unrecognized"]
+        if assigned:
+            seen = set()
+            lines = []
+            for name, env_var in assigned:
+                if name in seen:
+                    continue
+                seen.add(name)
+                lines.append(f"  • {name}   [{env_var}]")
+            summary = "Detected and assigned:\n\n" + "\n".join(lines)
+            if unrecognized:
+                summary += (f"\n\n{len(unrecognized)} pasted line(s) didn't match any known "
+                            f"provider key format and were ignored.")
+            messagebox.showinfo("Providers detected", summary)
+        elif unrecognized:
+            messagebox.showwarning(
+                "No keys recognized",
+                f"{len(unrecognized)} line(s) were pasted but none matched a known "
+                "provider key format, so nothing was assigned. Continuing anyway -- use "
+                "'Check API Key' in the main window if the crawl fails to start.")
+
+    _paste_keys_popup()
+
     class App(tk.Tk):
         def __init__(self):
             super().__init__()
@@ -1423,10 +1964,14 @@ def _run_gui():
             ttk.Spinbox(opts, from_=1, to=10, textvariable=self.max_candidates_var, width=5).grid(
                 row=1, column=1, sticky="w", padx=(4, 0), pady=(4, 0))
 
-            tk.Label(opts, text="Groq model:", bg=BG_DARK, fg=ACCENT_AMBER).grid(
+            tk.Label(opts, text="Model override:", bg=BG_DARK, fg=ACCENT_AMBER).grid(
                 row=2, column=0, sticky="w", pady=(4, 0))
             ttk.Entry(opts, textvariable=self.model_var, width=24).grid(
                 row=2, column=1, sticky="w", padx=(4, 0), pady=(4, 0))
+            tk.Label(opts, text="(optional -- pins the first model tried on every provider; "
+                                 "leave blank to use each provider's own model fallback list)",
+                     bg=BG_DARK, fg=FG_DIM, font=("Segoe UI", 8)).grid(
+                row=3, column=0, columnspan=2, sticky="w")
 
             ctrl = tk.Frame(self, bg=BG_DARK, padx=8)
             ctrl.pack(fill="x")
@@ -1698,18 +2243,20 @@ def _run_gui():
 
         def _on_check_key_clicked(self):
             _refresh_groq_env()
-            title = "GROQ_API_KEY found" if GROQ_API_KEY else "GROQ_API_KEY missing"
-            if GROQ_API_KEY:
-                messagebox.showinfo(title, groq_key_diagnostic())
+            any_key = any(os.environ.get(p["api_key_env"], "").strip() for p in LLM_PROVIDERS)
+            title = "Provider key(s) found" if any_key else "No provider API keys found"
+            if any_key:
+                messagebox.showinfo(title, llm_provider_diagnostic())
             else:
-                messagebox.showerror(title, groq_key_diagnostic())
+                messagebox.showerror(title, llm_provider_diagnostic())
 
         def _on_start_clicked(self):
             if self._running:
                 return
             _refresh_groq_env()  # picks up a .env edited or a var exported after this GUI launched
-            if not GROQ_API_KEY:
-                messagebox.showerror("GROQ_API_KEY missing", groq_key_diagnostic())
+            reset_provider_fallback_state()  # give every provider a clean shot for this new run
+            if not _configured_providers():
+                messagebox.showerror("No LLM provider API keys set", llm_provider_diagnostic())
                 return
             domains = self._parse_domains()
             if not domains:
@@ -2004,7 +2551,11 @@ def main():
     parser.add_argument("--output", default="deepship_results.json", help="Where to write the JSON results")
     parser.add_argument("--max-candidates", type=int, default=DEFAULT_MAX_CANDIDATES,
                          help="How many Groq-ranked candidate links to deep-dive per college (default: %(default)s)")
-    parser.add_argument("--model", default=None, help="Override GROQ_MODEL for this run")
+    parser.add_argument("--model", default=None,
+                         help="Pin the first model tried on every provider (each provider still "
+                              "falls back through its own other models, then the next provider, "
+                              "if that one's unavailable). Leave unset to use each provider's "
+                              "built-in model list / <PROVIDER>_MODEL env var as-is.")
     parser.add_argument("--quiet", action="store_true", help="Suppress progress logging")
     args = parser.parse_args()
 
@@ -2021,8 +2572,10 @@ def main():
         if not args.quiet:
             print(msg)
 
-    if not GROQ_API_KEY:
-        print("! GROQ_API_KEY isn't set (env var or .env file next to this script). Exiting.", file=sys.stderr)
+    reset_provider_fallback_state()  # clean slate for this run
+    if not _configured_providers():
+        print("! No LLM provider API keys are set. Exiting.\n", file=sys.stderr)
+        print(llm_provider_diagnostic(), file=sys.stderr)
         sys.exit(1)
 
     all_results = []
