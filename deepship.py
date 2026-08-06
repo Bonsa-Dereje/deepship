@@ -24,6 +24,18 @@ Pipeline + live GUI that, for a list of college domains (e.g. princeton.edu):
        structured records (name, eligibility, amount, deadline, how to
        apply, etc). Both passes' output are kept and shown -- pass 1's raw
        snippets and pass 2's structured entries.
+       Pass 3 (FAQ gap-fill): if Groq flagged a FAQ page during triage,
+       fetches it and walks it through Groq to enrich the pass 2 entries
+       with anything the FAQ adds.
+       Pass 4 (regex cross-check, no Groq call): purely mechanical. Re-scans
+       the *raw* BeautifulSoup text already pulled for every finaid page and
+       the FAQ page for whole paragraphs containing any of a fixed list of
+       financial-aid keywords (financial aid, need-based, need-blind,
+       scholarship, grant, fellowship, FAFSA, work-study, etc). Every
+       matching paragraph is kept in full, then checked for word-overlap
+       against pass 3's (or pass 2's, if no FAQ) structured output so
+       paragraphs that don't seem reflected anywhere in the LLM output get
+       flagged as possibly-missed / new info for a human to double check.
 
 Adaptive chunking (the "clump to 4, clump to 6" behavior):
   A page is first split in TWO and each half is sent to Groq. If Groq (or
@@ -559,6 +571,135 @@ def chunk_text(text, n):
 
 
 # ---------------------------------------------------------------------------
+# Step 4b: Pass 4 -- pure-regex cross-check (no Groq call at all)
+# ---------------------------------------------------------------------------
+# This re-scans the *raw* extract_page_text() output -- the same
+# BeautifulSoup visible-text passes 1/2/3 work from -- for whole paragraphs
+# that mention financial aid in some form. It's a mechanical safety net:
+# passes 1-3 all go through an LLM and can miss or mis-summarize things, so
+# pass 4 gives a plain-text list of every paragraph that *looks* relevant by
+# keyword alone, for a human to compare against what the LLM actually wrote
+# up. It never calls Groq and never rewrites anything -- paragraphs are kept
+# verbatim, in full.
+
+PASS4_KEYWORDS = [
+    r"financial aid", r"financial assistance", r"need-based", r"need based",
+    r"need-blind", r"need blind", r"\baid\b", r"scholarships?", r"grants?",
+    r"fellowships?", r"tuition assistance", r"tuition waiver", r"tuition-free",
+    r"work[- ]study", r"stipends?", r"bursar(?:y|ies)", r"cost of attendance",
+    r"\bFAFSA\b", r"CSS Profile", r"Pell Grant", r"full[- ]ride",
+    r"full[- ]tuition", r"merit[- ]based", r"merit aid", r"loan forgiveness",
+    r"student loans?", r"endowed scholarship", r"\bawards?\b", r"waivers?",
+    r"subsid(?:y|ies)", r"discounted tuition", r"free tuition", r"free ride",
+    r"low[- ]income", r"first[- ]generation", r"deadline", r"eligib(?:le|ility)",
+    r"apply for aid", r"application fee waiver",
+]
+
+PASS4_REGEX = re.compile("|".join(PASS4_KEYWORDS), re.IGNORECASE)
+
+_PASS4_WORD_RE = re.compile(r"[a-z0-9$%]+")
+
+
+def _pass4_tokenset(s):
+    return set(_PASS4_WORD_RE.findall((s or "").lower()))
+
+
+def _pass4_normalize(s):
+    return re.sub(r"\s+", " ", s or "").strip().lower()
+
+
+def regex_sweep_paragraphs(text, source_label=""):
+    """PASS 4 core: splits `text` into paragraphs on blank-line boundaries
+    (same split chunk_text() uses) and returns every WHOLE paragraph that
+    contains one or more PASS4_KEYWORDS hits, each tagged with which
+    keyword(s) matched and where it came from. Pure regex -- no Groq."""
+    if not text or not text.strip():
+        return []
+    paragraphs = re.split(r"\n\s*\n", text)
+    out = []
+    for para in paragraphs:
+        para = para.strip()
+        if not para:
+            continue
+        hits = sorted(set(m.group(0).lower() for m in PASS4_REGEX.finditer(para)))
+        if hits:
+            out.append({"source": source_label, "paragraph": para, "matched_keywords": hits})
+    return out
+
+
+def run_pass4_regex_sweep(result, overlap_threshold=0.35, log=None, on_event=None):
+    """PASS 4. No Groq calls. Re-scans the raw text already stashed on
+    result["pages"][*]["raw_text"] and result["faq_raw_text"] (set during
+    passes 1-3) for keyword-bearing paragraphs, dedupes them, and flags any
+    paragraph whose distinctive words barely show up in pass 3's (or pass
+    2's, if there was no FAQ gap-fill) combined structured output -- a
+    cheap word-overlap heuristic for "does the LLM output already cover
+    this, or did it possibly get missed / hallucinated over". Sets
+    result["pass4_paragraphs"] (everything found) and
+    result["pass4_flagged_new_info"] (the low-overlap subset)."""
+    def _log(msg):
+        if log:
+            log(msg)
+
+    domain = result.get("college", "")
+    if on_event:
+        on_event("pass4_start", domain=domain)
+
+    all_paragraphs = []
+    seen = set()
+
+    for page in result.get("pages", []):
+        for item in regex_sweep_paragraphs(page.get("raw_text", ""), source_label=page.get("url", "")):
+            key = _pass4_normalize(item["paragraph"])
+            if key in seen:
+                continue
+            seen.add(key)
+            all_paragraphs.append(item)
+
+    faq_raw = result.get("faq_raw_text", "")
+    if faq_raw:
+        faq_label = result.get("faq_url", "") or "(faq page)"
+        for item in regex_sweep_paragraphs(faq_raw, source_label=faq_label):
+            key = _pass4_normalize(item["paragraph"])
+            if key in seen:
+                continue
+            seen.add(key)
+            all_paragraphs.append(item)
+
+    # "The entire output" to compare against -- pass 3's FAQ-enriched
+    # entries if there are any, otherwise fall back to pass 2's combined
+    # structured entries.
+    pass3_entries = result.get("scholarships_faq_enriched") or \
+        [e for p in result.get("pages", []) for e in p.get("scholarships", [])]
+    pass3_blob = " ".join(
+        f"{e.get('type', '')} {e.get('summary', '')}"
+        for e in pass3_entries if isinstance(e, dict)
+    )
+    pass3_tokens = _pass4_tokenset(pass3_blob)
+
+    flagged = []
+    for item in all_paragraphs:
+        distinctive = {t for t in _pass4_tokenset(item["paragraph"]) if len(t) > 3}
+        if not distinctive:
+            continue
+        overlap = len(distinctive & pass3_tokens) / len(distinctive)
+        item["overlap_with_pass3"] = round(overlap, 2)
+        if overlap < overlap_threshold:
+            flagged.append(item)
+
+    result["pass4_paragraphs"] = all_paragraphs
+    result["pass4_flagged_new_info"] = flagged
+
+    _log(f"  -> pass 4 (regex, no Groq): {len(all_paragraphs)} matching paragraph(s) found; "
+         f"{len(flagged)} look like they may have info not reflected in pass 3's output.")
+
+    if on_event:
+        on_event("pass4_done", domain=domain, paragraphs=all_paragraphs, flagged=flagged)
+
+    return all_paragraphs, flagged
+
+
+# ---------------------------------------------------------------------------
 # PASS 1 -- loose sweep: pull out any bits of text that LOOK LIKE they might
 # be a scholarship / need-based aid / full-ride mention. No structuring yet,
 # no deadline-parsing, no filtering for "is this really a distinct award" --
@@ -956,7 +1097,8 @@ def process_college(domain, max_candidates=DEFAULT_MAX_CANDIDATES, model=None, l
             print(msg)
 
     homepage_url = trim_to_domain(domain)
-    result = {"college": domain, "homepage": homepage_url, "candidate_links": [], "pages": []}
+    result = {"college": domain, "homepage": homepage_url, "candidate_links": [], "pages": [],
+              "faq_raw_text": "", "pass4_paragraphs": [], "pass4_flagged_new_info": []}
 
     if on_event:
         on_event("college_start", domain=domain, homepage=homepage_url, index=index, total=total)
@@ -1026,7 +1168,8 @@ def process_college(domain, max_candidates=DEFAULT_MAX_CANDIDATES, model=None, l
             continue
         time.sleep(POLITE_DELAY_S)
         page_record = {"url": url, "confidence": candidate.get("confidence"),
-                        "reason": candidate.get("reason"), "pass1_snippets": [], "scholarships": []}
+                        "reason": candidate.get("reason"), "pass1_snippets": [], "scholarships": [],
+                        "raw_text": ""}
         if on_event:
             on_event("page_start", domain=domain, url=url, confidence=candidate.get("confidence"),
                       reason=candidate.get("reason"))
@@ -1035,6 +1178,7 @@ def process_college(domain, max_candidates=DEFAULT_MAX_CANDIDATES, model=None, l
             if on_event:
                 on_event("page_fetched", domain=domain, url=url, html_len=len(html))
             text = extract_page_text(html, log=_log)
+            page_record["raw_text"] = text
             if on_event:
                 on_event("page_text_extracted", domain=domain, url=url, text=text)
             if not text.strip():
@@ -1076,6 +1220,7 @@ def process_college(domain, max_candidates=DEFAULT_MAX_CANDIDATES, model=None, l
                 on_event("faq_fetch_start", domain=domain, url=faq_url)
             faq_html = fetch_url(faq_url, log=_log)
             faq_text = extract_page_text(faq_html, log=_log)
+            result["faq_raw_text"] = faq_text
             if on_event:
                 on_event("faq_fetched", domain=domain, url=faq_url, text_len=len(faq_text))
             if faq_text.strip():
@@ -1094,6 +1239,13 @@ def process_college(domain, max_candidates=DEFAULT_MAX_CANDIDATES, model=None, l
             _log(f"  ! FAQ gap-fill failed on {faq_url}: {exc}")
     elif faq_candidates and not combined_entries:
         _log("  (found an FAQ page, but no pass-2 entries to gap-fill yet -- skipping.)")
+
+    # PASS 4 -- pure-regex cross-check of the raw BeautifulSoup text against
+    # pass 3's (or pass 2's) structured output. No Groq call.
+    try:
+        run_pass4_regex_sweep(result, log=_log, on_event=on_event)
+    except Exception as exc:
+        _log(f"  ! pass 4 regex sweep failed: {exc}")
 
     scholarship_count = sum(len(p.get("scholarships", [])) for p in result["pages"])
     if on_event:
@@ -1793,6 +1945,25 @@ def _run_gui():
                         continue
                     self._add_scholarship_card(domain, e.get("type", ""), e.get("summary", ""), enriched=True)
 
+            elif event == "pass4_start":
+                self.pipe_status.configure(text=f"Regex cross-check (pass 4, no Groq) for {domain}")
+                self._groq_log(f"[{ts}] -> [PASS 4 / regex cross-check, no Groq call] scanning "
+                                f"raw page text for {domain}", "hdr")
+
+            elif event == "pass4_done":
+                paragraphs = kw.get("paragraphs", [])
+                flagged = kw.get("flagged", [])
+                self._groq_log(f"[{ts}] === [PASS 4] {domain} -- {len(paragraphs)} keyword-matched "
+                                f"paragraph(s) found, {len(flagged)} flagged as possibly not reflected "
+                                f"in pass 3's output ===", "hdr")
+                for item in paragraphs:
+                    tag = "warn" if item in flagged else "pass1"
+                    flag_note = "  [POSSIBLY NEW / NOT IN PASS 3]" if item in flagged else ""
+                    kws = ", ".join(item.get("matched_keywords", []))
+                    self._groq_log(f"    • ({kws}) [{item.get('source', '')}]{flag_note}", tag)
+                    snippet = item.get("paragraph", "").replace("\n", " ")
+                    self._groq_log(f"      {snippet[:500]}", "raw")
+
             elif event == "college_done":
                 self._stats["colleges_done"] += 1
                 self._refresh_stats_labels()
@@ -1866,12 +2037,16 @@ def main():
     total_scholarships = sum(len(p.get("scholarships", [])) for r in all_results for p in r.get("pages", []))
     total_faq_enriched = sum(len(r.get("scholarships_faq_enriched", [])) for r in all_results)
     colleges_with_faq = sum(1 for r in all_results if r.get("faq_url"))
+    total_pass4_paragraphs = sum(len(r.get("pass4_paragraphs", [])) for r in all_results)
+    total_pass4_flagged = sum(len(r.get("pass4_flagged_new_info", [])) for r in all_results)
     print(f"\nDone. {len(domains)} college(s) processed.")
     print(f"  Pass 1 (loose sweep):    {total_snippets} possible scholarship/aid snippet(s) found.")
     print(f"  Pass 2 (structured):     {total_scholarships} scholarship entr"
           f"{'y' if total_scholarships == 1 else 'ies'} produced.")
     print(f"  Pass 3 (FAQ gap-fill):   {total_faq_enriched} enriched entr"
           f"{'y' if total_faq_enriched == 1 else 'ies'} across {colleges_with_faq} college(s) with an FAQ page found.")
+    print(f"  Pass 4 (regex, no LLM):  {total_pass4_paragraphs} keyword-matched paragraph(s) found; "
+          f"{total_pass4_flagged} flagged as possibly missing from pass 3's output.")
     print(f"  Full results (all passes) written to {args.output}")
 
 
