@@ -134,7 +134,7 @@ def _refresh_groq_env():
     os.environ, so this never clobbers something already set."""
     global ENV_DEBUG, GROQ_API_KEY, GROQ_MODEL
     ENV_DEBUG = _load_dotenv_if_present()
-    GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "PASTE_YOUR_GROQ_API_KEY_HERE")
+    GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "paste")
     GROQ_MODEL = os.environ.get("GROQ_MODEL", GROQ_MODEL)
 
 
@@ -440,16 +440,21 @@ def crawl_homepage_links(homepage_url, log=None, on_event=None):
 # ---------------------------------------------------------------------------
 
 LINK_TRIAGE_SYSTEM = (
-    "You are helping a crawler find the financial aid / scholarships page "
-    "on a college website, given only its home page's links. You will be "
-    "given a JSON list of {url, text} pairs scraped from the home page. "
-    "Pick every link that plausibly leads to financial aid, scholarships, "
-    "cost of attendance, tuition assistance, grants, or student financial "
+    "You are helping a crawler find two kinds of pages on a college "
+    "website, given only its home page's links. You will be given a JSON "
+    "list of {url, text} pairs scraped from the home page. Pick every "
+    "link that plausibly leads to EITHER of these: "
+    "(1) kind \"finaid\" -- financial aid, scholarships, cost of "
+    "attendance, tuition assistance, grants, or student financial "
     "services -- include a link even if it's just a hub/menu page that "
-    "probably links onward to the real scholarships page. "
+    "probably links onward to the real scholarships page; "
+    "(2) kind \"faq\" -- a Frequently Asked Questions page, whether it's a "
+    "financial-aid-specific FAQ or a general/admissions FAQ that likely "
+    "touches on cost, aid, or scholarships. "
     "Respond ONLY with raw JSON (no prose, no markdown fences): a JSON "
     "array of objects, ranked best-guess first, each shaped exactly like "
-    '{"url": "...", "reason": "short reason", "confidence": "high|medium|low"}. '
+    '{"url": "...", "reason": "short reason", "confidence": "high|medium|low", '
+    '"kind": "finaid|faq"}. '
     "If truly nothing on the list looks relevant, respond with an empty "
     "JSON array: []"
 )
@@ -489,7 +494,10 @@ def ask_groq_for_finaid_links(homepage_url, links, log=None, on_event=None, mode
     out = []
     for item in parsed:
         if isinstance(item, str):
-            item = {"url": item, "reason": "", "confidence": "medium"}
+            item = {"url": item, "reason": "", "confidence": "medium", "kind": "finaid"}
+        item.setdefault("kind", "finaid")
+        if item.get("kind") not in ("finaid", "faq"):
+            item["kind"] = "finaid"
         url = (item or {}).get("url")
         if url and url in valid_urls:
             out.append(item)
@@ -835,6 +843,107 @@ def extract_scholarships_from_page(source_url, page_text, log=None, model=None, 
 
 
 # ---------------------------------------------------------------------------
+# PASS 3 -- FAQ gap-fill: after pass 2 has rough type+summary cards for a
+# college, use that college's FAQ page (if the link-triage step found one)
+# to fill in anything a card is missing -- a deadline, an amount, an
+# eligibility detail -- and to pick up any program that's only mentioned on
+# the FAQ page and nowhere else. This never invents; it only adds what the
+# FAQ text actually says, and only touches the {type, summary} shape pass 2
+# already produced.
+# ---------------------------------------------------------------------------
+
+GAP_FILL_SYSTEM = (
+    "You are given a list of rough scholarship/financial-aid program "
+    "summaries that were already written up (each has a loose \"type\" "
+    "and a plain-language \"summary\"), plus a chunk of this same "
+    "college's FAQ page text. Your job is to fill in GAPS in the existing "
+    "summaries using anything relevant on this FAQ chunk -- a deadline, an "
+    "amount, an eligibility detail, a renewal rule, or how to apply, that "
+    "wasn't already mentioned. Do not invent anything not actually stated "
+    "in the FAQ text. If the FAQ chunk doesn't add anything useful for a "
+    "given program, leave that program's summary as it was (light wording "
+    "cleanup is fine, but don't shorten it or drop real content). If this "
+    "FAQ chunk clearly describes a genuinely NEW program that wasn't in "
+    "the list at all, add it as a new {type, summary} entry. "
+    "Respond ONLY with a raw JSON array covering ALL programs -- the "
+    "existing ones (updated where the FAQ helped) plus any new ones found "
+    "-- each shaped exactly like {\"type\": \"...\", \"summary\": \"...\"}. "
+    "No prose, no markdown fences."
+)
+
+
+def _build_gap_fill_prompt(faq_chunk, faq_url, chunk_index, total_chunks, current_entries_json):
+    header = f"FAQ page: {faq_url}\nFAQ chunk {chunk_index + 1} of {total_chunks}.\n\n"
+    body = (
+        "Program summaries so far (from pass 2, to be enriched -- carry "
+        "every one of these forward in your reply, updated or unchanged):\n"
+        f"{current_entries_json}\n\n"
+        f"FAQ page text chunk:\n{faq_chunk}"
+    )
+    return header + body
+
+
+def gap_fill_with_faq(college_domain, entries, faq_url, faq_text, log=None, model=None,
+                       on_event=None, stop_flag=None):
+    """PASS 3. Walks the FAQ page text in the same 2 -> 4 -> 6 chunk ladder
+    as passes 1/2, each time asking Groq to enrich the *running* list of
+    {type, summary} entries with anything new the FAQ chunk adds. Returns
+    the enriched, deduped entry list (or the original entries unchanged if
+    there's no FAQ text or every attempt fails). Fires gap_fill_request /
+    gap_fill_response / payload_too_large events."""
+    def _log(msg):
+        if log:
+            log(msg)
+
+    if not faq_text or not faq_text.strip() or not entries:
+        return entries
+
+    for split_n in SPLIT_LADDER:
+        _check_stop(stop_flag)
+        chunks = chunk_text(faq_text, split_n)
+        _log(f"  [pass 3 / FAQ gap-fill] Trying {faq_url} split into {len(chunks)} chunk(s)...")
+        try:
+            working = list(entries)
+            for idx, chunk in enumerate(chunks):
+                _check_stop(stop_flag)
+                if on_event:
+                    on_event("gap_fill_request", domain=college_domain, url=faq_url,
+                              chunk_index=idx, total_chunks=len(chunks))
+                prompt = _build_gap_fill_prompt(chunk, faq_url, idx, len(chunks),
+                                                 json.dumps(working, ensure_ascii=False))
+                content = call_groq(
+                    [
+                        {"role": "system", "content": GAP_FILL_SYSTEM},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0,
+                    max_tokens=3000,
+                    model=model,
+                    log=log,
+                )
+                parsed = _extract_json(content)
+                if isinstance(parsed, dict):
+                    parsed = parsed.get("scholarships") or parsed.get("entries") or []
+                if isinstance(parsed, list) and parsed:
+                    working = parsed
+                else:
+                    _log(f"  ! [pass 3] FAQ chunk {idx + 1}/{len(chunks)} wasn't usable JSON -- keeping prior entries.")
+                if on_event:
+                    on_event("gap_fill_response", domain=college_domain, url=faq_url,
+                              chunk_index=idx, total_chunks=len(chunks), raw=content, entries=working)
+            return _dedupe_scholarship_entries(working)
+        except PayloadTooLargeError:
+            _log(f"  [pass 3] Payload too large at split={split_n} -- escalating to a finer split.")
+            if on_event:
+                on_event("payload_too_large", url=faq_url, split_n=split_n, pass_num=3)
+            continue
+
+    _log(f"  ! [pass 3] Gave up on {faq_url} -- even {SPLIT_LADDER[-1]}-way split was too large; "
+         f"leaving pass-2 entries as-is.")
+    return entries
+
+
+# ---------------------------------------------------------------------------
 # Orchestration: one college end-to-end
 # ---------------------------------------------------------------------------
 
@@ -890,19 +999,27 @@ def process_college(domain, max_candidates=DEFAULT_MAX_CANDIDATES, model=None, l
         return result
 
     result["candidate_links"] = candidates
+    finaid_candidates = [c for c in candidates if c.get("kind", "finaid") == "finaid"]
+    faq_candidates = [c for c in candidates if c.get("kind") == "faq"]
+
     if on_event:
-        on_event("candidates_selected", domain=domain, candidates=candidates[:max_candidates])
-    if not candidates:
+        on_event("candidates_selected", domain=domain, candidates=finaid_candidates[:max_candidates])
+        if faq_candidates:
+            on_event("faq_candidate_selected", domain=domain, candidate=faq_candidates[0])
+
+    if not finaid_candidates:
         _log("  Groq found no plausible financial aid / scholarships link on the home page.")
         if on_event:
             on_event("college_done", domain=domain, candidate_count=0, page_count=0, scholarship_count=0)
         return result
 
-    _log(f"  Groq flagged {len(candidates)} candidate link(s), deep-diving top {max_candidates}:")
-    for c in candidates[:max_candidates]:
+    _log(f"  Groq flagged {len(finaid_candidates)} finaid candidate link(s), deep-diving top {max_candidates}:")
+    for c in finaid_candidates[:max_candidates]:
         _log(f"    - [{c.get('confidence', '?')}] {c.get('url')} :: {c.get('reason', '')}")
+    if faq_candidates:
+        _log(f"  Groq also flagged an FAQ page to use for gap-filling: {faq_candidates[0].get('url')}")
 
-    for candidate in candidates[:max_candidates]:
+    for candidate in finaid_candidates[:max_candidates]:
         _check_stop(stop_flag)
         url = candidate.get("url")
         if not url:
@@ -943,6 +1060,40 @@ def process_college(domain, max_candidates=DEFAULT_MAX_CANDIDATES, model=None, l
             if on_event:
                 on_event("page_done", domain=domain, url=url, snippets=[], entries=[], error=str(exc))
         result["pages"].append(page_record)
+
+    # PASS 3 -- FAQ gap-fill: if Groq flagged an FAQ page, fetch it and use
+    # it to fill in gaps in the pass-2 summaries gathered above.
+    combined_entries = [e for p in result["pages"] for e in p.get("scholarships", [])]
+    result["faq_url"] = None
+    result["scholarships_faq_enriched"] = []
+    if faq_candidates and combined_entries:
+        faq_url = faq_candidates[0].get("url")
+        result["faq_url"] = faq_url
+        _check_stop(stop_flag)
+        time.sleep(POLITE_DELAY_S)
+        try:
+            if on_event:
+                on_event("faq_fetch_start", domain=domain, url=faq_url)
+            faq_html = fetch_url(faq_url, log=_log)
+            faq_text = extract_page_text(faq_html, log=_log)
+            if on_event:
+                on_event("faq_fetched", domain=domain, url=faq_url, text_len=len(faq_text))
+            if faq_text.strip():
+                enriched = gap_fill_with_faq(domain, combined_entries, faq_url, faq_text, log=_log,
+                                              model=model, on_event=on_event, stop_flag=stop_flag)
+                result["scholarships_faq_enriched"] = enriched
+                _log(f"  -> pass 3: FAQ gap-fill produced {len(enriched)} entr"
+                     f"{'y' if len(enriched) == 1 else 'ies'} (from {len(combined_entries)} going in)")
+                if on_event:
+                    on_event("gap_fill_done", domain=domain, url=faq_url, entries=enriched)
+            else:
+                _log(f"  ! {faq_url} had no visible text after extraction, skipping FAQ gap-fill.")
+        except StopRequested:
+            raise
+        except Exception as exc:
+            _log(f"  ! FAQ gap-fill failed on {faq_url}: {exc}")
+    elif faq_candidates and not combined_entries:
+        _log("  (found an FAQ page, but no pass-2 entries to gap-fill yet -- skipping.)")
 
     scholarship_count = sum(len(p.get("scholarships", [])) for p in result["pages"])
     if on_event:
@@ -1321,15 +1472,17 @@ def _run_gui():
                     return color
             return FG_DIM
 
-        def _add_scholarship_card(self, college, type_str, summary):
+        def _add_scholarship_card(self, college, type_str, summary, enriched=False):
             badge_color = self._color_for_type(type_str)
-            card = tk.Frame(self.cards_container, bg=BG_PANEL2, highlightthickness=1,
-                             highlightbackground=BORDER, padx=8, pady=6)
+            border_color = GREEN if enriched else BORDER
+            card = tk.Frame(self.cards_container, bg=BG_PANEL2, highlightthickness=2 if enriched else 1,
+                             highlightbackground=border_color, padx=8, pady=6)
             card.pack(fill="x", padx=2, pady=3)
 
             top_row = tk.Frame(card, bg=BG_PANEL2)
             top_row.pack(fill="x")
-            tk.Label(top_row, text=college, bg=BG_PANEL2, fg=FG_BRIGHT,
+            name_text = college + ("  ✓ FAQ-enriched" if enriched else "")
+            tk.Label(top_row, text=name_text, bg=BG_PANEL2, fg=(GREEN if enriched else FG_BRIGHT),
                      font=("TkDefaultFont", 9, "bold")).pack(side="left")
             tk.Label(top_row, text=(type_str or "unclassified"), bg=BG_PANEL2, fg=badge_color,
                      font=("TkDefaultFont", 8, "bold")).pack(side="right")
@@ -1528,6 +1681,11 @@ def _run_gui():
                                                        values=(c.get("confidence", "?"), "queued", 0))
                     self._links_tree_rows[u] = item_id
 
+            elif event == "faq_candidate_selected":
+                c = kw.get("candidate", {}) or {}
+                self._groq_log(f"[{ts}]    FAQ page picked for gap-fill: {c.get('url', '')} "
+                                f"({c.get('reason', '')})", "warn")
+
             elif event == "page_start":
                 item_id = self._links_tree_rows.get(url)
                 if item_id:
@@ -1607,6 +1765,34 @@ def _run_gui():
                     self.links_tree.set(item_id, "status", status)
                     self.links_tree.set(item_id, "found", f"{len(entries)} ({len(snippets)} raw)")
 
+            elif event == "faq_fetch_start":
+                self.pipe_status.configure(text=f"Fetching FAQ page {url}")
+                self._groq_log(f"[{ts}] -> [PASS 3 / FAQ gap-fill] fetching {url}", "hdr")
+
+            elif event == "faq_fetched":
+                self._groq_log(f"[{ts}]    FAQ page extracted ({kw.get('text_len', 0)} chars): {url}", "warn")
+
+            elif event == "gap_fill_request":
+                self._stats["groq_calls"] += 1
+                self._refresh_stats_labels()
+                self._groq_log(f"[{ts}] -> [PASS 3 / FAQ gap-fill] chunk {kw.get('chunk_index', 0) + 1}/"
+                                f"{kw.get('total_chunks', 1)} :: {url}", "hdr")
+
+            elif event == "gap_fill_response":
+                entries = kw.get("entries", [])
+                self._groq_log(f"[{ts}] <- [PASS 3] running total after this FAQ chunk: "
+                                f"{len(entries)} entr{'y' if len(entries) == 1 else 'ies'}", "hdr")
+                self._groq_log((kw.get("raw") or "")[:1500], "raw")
+
+            elif event == "gap_fill_done":
+                entries = kw.get("entries", [])
+                self._groq_log(f"[{ts}] === [PASS 3] FAQ gap-fill done for {domain} — "
+                                f"{len(entries)} enriched entr{'y' if len(entries) == 1 else 'ies'} ===", "hdr")
+                for e in entries:
+                    if not isinstance(e, dict):
+                        continue
+                    self._add_scholarship_card(domain, e.get("type", ""), e.get("summary", ""), enriched=True)
+
             elif event == "college_done":
                 self._stats["colleges_done"] += 1
                 self._refresh_stats_labels()
@@ -1678,11 +1864,15 @@ def main():
 
     total_snippets = sum(len(p.get("pass1_snippets", [])) for r in all_results for p in r.get("pages", []))
     total_scholarships = sum(len(p.get("scholarships", [])) for r in all_results for p in r.get("pages", []))
+    total_faq_enriched = sum(len(r.get("scholarships_faq_enriched", [])) for r in all_results)
+    colleges_with_faq = sum(1 for r in all_results if r.get("faq_url"))
     print(f"\nDone. {len(domains)} college(s) processed.")
-    print(f"  Pass 1 (loose sweep):  {total_snippets} possible scholarship/aid snippet(s) found.")
-    print(f"  Pass 2 (structured):   {total_scholarships} scholarship entr"
+    print(f"  Pass 1 (loose sweep):    {total_snippets} possible scholarship/aid snippet(s) found.")
+    print(f"  Pass 2 (structured):     {total_scholarships} scholarship entr"
           f"{'y' if total_scholarships == 1 else 'ies'} produced.")
-    print(f"  Full results (both passes) written to {args.output}")
+    print(f"  Pass 3 (FAQ gap-fill):   {total_faq_enriched} enriched entr"
+          f"{'y' if total_faq_enriched == 1 else 'ies'} across {colleges_with_faq} college(s) with an FAQ page found.")
+    print(f"  Full results (all passes) written to {args.output}")
 
 
 if __name__ == "__main__":
