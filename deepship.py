@@ -75,28 +75,15 @@ Requirements:
     pip install requests beautifulsoup4
 
 Config (env vars, or a .env file sitting next to this script):
-    GROQ_API_KEY=gsk_...                  (at least one provider key required)
-    GROQ_MODEL=openai/gpt-oss-120b           (optional -- pins Groq's FIRST-tried
-                                               model; Groq still falls back through
-                                               its other models, then other
-                                               providers, if that one's unavailable)
+    OLLAMA_BASE_URL=https://offr.tail05ae98.ts.net   (your local/Tailscale Ollama
+                                                        server; no API key needed)
+    OLLAMA_MODEL=qwen2.5:1.5b                         (optional -- overrides the
+                                                        default model below)
 
-    Every LLM call in this script (link triage, pass 1/2/3) goes through a
-    provider FALLBACK CHAIN, not just Groq. If Groq's free tier runs out
-    (or any other error keeps happening), the very next call automatically
-    moves on to the next provider below that has a key configured -- same
-    prompt, no restart needed. Add whichever of these you have keys for;
-    unset ones are just skipped:
-        CEREBRAS_API_KEY / CEREBRAS_MODEL     (default: llama-3.3-70b)
-        TOGETHER_API_KEY / TOGETHER_MODEL     (default: meta-llama/Llama-3.3-70B-Instruct-Turbo)
-        FIREWORKS_API_KEY / FIREWORKS_MODEL   (default: accounts/fireworks/models/llama-v3p3-70b-instruct)
-        OPENROUTER_API_KEY / OPENROUTER_MODEL (default: meta-llama/llama-3.3-70b-instruct)
-        DEEPSEEK_API_KEY / DEEPSEEK_MODEL     (default: deepseek-chat)
-        OPENAI_API_KEY / OPENAI_MODEL         (default: gpt-4o-mini)
-    That's also the fallback order (Groq first, OpenAI last -- roughly
-    cheapest/most-generous-free-tier to most expensive). Use the GUI's
-    "Check API Key" button, or the CLI's startup check, to see exactly
-    which providers were detected.
+    Every LLM call in this script (link triage, pass 1/2/3) goes through
+    your local Ollama server -- no cloud provider, no API key required.
+    Use the GUI's "Check API Key" button, or the CLI's startup check, to
+    confirm the server/model that's configured.
 
 Usage:
     python3 deepship.py                          # launches the GUI
@@ -152,66 +139,45 @@ ENV_DEBUG = _load_dotenv_if_present()
 # Config
 # ---------------------------------------------------------------------------
 
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "PASTE_YOUR_GROQ_API_KEY_HERE")
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
-GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
+OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "https://offr.tail05ae98.ts.net").rstrip("/")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:1.5b")
+OLLAMA_ENDPOINT = f"{OLLAMA_BASE_URL}/v1/chat/completions"
 
 
 def _refresh_groq_env():
-    """Re-runs the .env loader and re-reads GROQ_API_KEY / GROQ_MODEL from
-    os.environ. Safe to call repeatedly (e.g. right before Start is
+    """Re-runs the .env loader and re-reads OLLAMA_BASE_URL / OLLAMA_MODEL
+    from os.environ. Safe to call repeatedly (e.g. right before Start is
     clicked in the GUI) so editing .env or exporting the var AFTER the
     script/GUI process already started doesn't require a full restart --
     _load_dotenv_if_present() only fills in keys not already in
-    os.environ, so this never clobbers something already set."""
-    global ENV_DEBUG, GROQ_API_KEY, GROQ_MODEL
+    os.environ, so this never clobbers something already set. (Name kept
+    for backwards compatibility with the rest of the GUI's call sites.)"""
+    global ENV_DEBUG, OLLAMA_BASE_URL, OLLAMA_MODEL, OLLAMA_ENDPOINT, GROQ_TIMEOUT_S
     ENV_DEBUG = _load_dotenv_if_present()
-    GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "paste")
-    GROQ_MODEL = os.environ.get("GROQ_MODEL", GROQ_MODEL)
+    OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", OLLAMA_BASE_URL).rstrip("/")
+    OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", OLLAMA_MODEL)
+    OLLAMA_ENDPOINT = f"{OLLAMA_BASE_URL}/v1/chat/completions"
+    GROQ_TIMEOUT_S = int(os.environ.get("OLLAMA_TIMEOUT_S", GROQ_TIMEOUT_S))
 
 
 def groq_key_diagnostic():
-    """Builds a precise, actionable status string about GROQ_API_KEY --
-    exactly which .env path was checked, whether that file exists, which
-    keys it actually parsed out of it, and whether GROQ_API_KEY is set in
-    the process's environment right now. Used both by call_groq()'s error
-    and by the GUI's "Check API Key" button / start-time check, so the
-    diagnosis is identical everywhere instead of a generic "it's missing.\""""
-    lines = []
-    if GROQ_API_KEY:
-        masked = GROQ_API_KEY[:4] + "…" + GROQ_API_KEY[-4:] if len(GROQ_API_KEY) > 10 else "(short key)"
-        lines.append(f"GROQ_API_KEY is set ({masked}).")
-        source = "a .env file" if "GROQ_API_KEY" in ENV_DEBUG.get("keys_loaded", []) else "the shell/process environment"
-        lines.append(f"Loaded from: {source}.")
-        return "\n".join(lines)
-
-    lines.append("GROQ_API_KEY is NOT currently set.")
-    lines.append(f".env path checked: {ENV_DEBUG['env_path']}")
-    if ENV_DEBUG["file_found"]:
-        keys = ENV_DEBUG["keys_loaded"]
-        lines.append(f".env file WAS found there. Keys it parsed from it: {keys or '(none)'}")
-        if "GROQ_API_KEY" not in keys and "GROQ_API_KEY" in os.environ:
-            lines.append("(GROQ_API_KEY IS in os.environ though -- odd state, try Check API Key again.)")
-        elif not keys:
-            lines.append("No KEY=VALUE lines were parsed at all -- check the file isn't empty/all-comments, "
-                          "and isn't secretly named '.env.txt' (a common issue on Windows).")
-        else:
-            lines.append("GROQ_API_KEY specifically wasn't among them -- check for a typo in the key name, "
-                          "stray quotes, or a line that doesn't look exactly like GROQ_API_KEY=gsk_...")
-    else:
-        lines.append(".env file was NOT found at that exact path.")
-        lines.append("If you have a .env file, it needs to sit in the SAME FOLDER as this .py script "
-                      "(not your terminal's current directory, and not renamed '.env.txt').")
-    lines.append("")
-    lines.append("If you used `export GROQ_API_KEY=...` in a terminal: that only applies to processes "
-                  "launched FROM that same terminal session. Double-clicking the script, running it from "
-                  "an IDE's Run button, or a new terminal tab will NOT see it -- the .env file is the more "
-                  "reliable option for exactly this reason.")
+    """Builds a status string about the local Ollama server config -- no
+    API key involved, just which base URL and model are configured and
+    where OLLAMA_BASE_URL/OLLAMA_MODEL came from. Kept the old function
+    name for backwards compatibility with existing call sites."""
+    lines = [f"Ollama server: {OLLAMA_BASE_URL}", f"Model: {OLLAMA_MODEL}", "No API key required."]
+    source = "a .env file" if "OLLAMA_BASE_URL" in ENV_DEBUG.get("keys_loaded", []) else "the default / shell environment"
+    lines.append(f"Base URL loaded from: {source}.")
     return "\n".join(lines)
 
 USER_AGENT = "DeepshipFinAidCrawler/1.0 (college financial aid research; contact: set-your-email-here)"
 REQUEST_TIMEOUT_S = 25
-GROQ_TIMEOUT_S = 60
+# A 60s ceiling is fine for short chat turns, but link-triage prompts can run
+# 10-15k+ chars (a linky home page), and a small local model on CPU can take
+# well over a minute to chew through that -- especially on the very first
+# call, which also pays the one-time cost of the model loading into memory.
+# Override with OLLAMA_TIMEOUT_S if even 180s isn't enough on your hardware.
+GROQ_TIMEOUT_S = int(os.environ.get("OLLAMA_TIMEOUT_S", "180"))
 POLITE_DELAY_S = 0.75
 
 # The chunking ladder described above: try whole-page-in-2, then 4, then 6.
@@ -219,6 +185,21 @@ SPLIT_LADDER = [2, 4, 6]
 
 DEFAULT_MAX_CANDIDATES = 3
 MAX_LINKS_SENT_TO_GROQ = 250  # trim an absurdly linky home page before triage
+
+# ---------------------------------------------------------------------------
+# Manual-paste mode: instead of actually POSTing to an LLM API, every call
+# pops up a window with the full prompt + a Copy button, and blocks until
+# you paste the model's reply back in and hit Submit. On by default; set
+# MANUAL_PASTE_MODE=0 in the environment / .env to go back to real HTTP
+# calls against the providers configured below.
+# ---------------------------------------------------------------------------
+MANUAL_PASTE_MODE = os.environ.get("MANUAL_PASTE_MODE", "1").strip() not in ("0", "false", "False", "")
+
+# Set by the GUI's App.__init__ so manual-paste popups triggered from the
+# background crawler thread can be safely built on the main (Tk) thread
+# instead. Stays None in CLI mode, where call_groq() runs on the main
+# thread anyway.
+_GUI_ROOT = None
 
 DEFAULT_SAMPLE_COLLEGES = [
     "princeton.edu", "harvard.edu", "mit.edu", "yale.edu", "stanford.edu",
@@ -328,90 +309,42 @@ def _check_stop(stop_flag):
 
 
 # ---------------------------------------------------------------------------
-# Multi-provider LLM config + auto-fallback
+# LLM config -- local Ollama server only, no cloud provider, no API key
 # ---------------------------------------------------------------------------
-# Every one of these speaks the same OpenAI-style POST /chat/completions
-# request/response shape Groq does, so one low-level caller can drive all
-# of them. Only providers with an API key actually set (env var or .env)
-# become part of the live fallback chain -- add nothing and it behaves
-# exactly like before (Groq only); drop in e.g. CEREBRAS_API_KEY and it's
-# used automatically the moment Groq's free tier taps out, no restart.
+# LLM_PROVIDERS is still a list (the rest of the pipeline's fallback-chain
+# machinery is written generically against it), but it now holds exactly
+# one entry: your local Ollama server, reached over Tailscale, speaking
+# its OpenAI-compatible POST /v1/chat/completions endpoint. No API key is
+# read or required -- api_key_env is None for this entry.
 
-LLM_PROVIDERS = [
-    {
-        # Groq deprecated its old Llama chat models (llama-3.3-70b-versatile,
-        # llama-3.1-8b-instant) for free/developer tier in mid-2026 in favor
-        # of these -- gpt-oss and Qwen3.6 are the current fast/free-tier picks.
-        "name": "groq",
-        "endpoint": "https://api.groq.com/openai/v1/chat/completions",
-        "api_key_env": "GROQ_API_KEY",
-        "model_env": "GROQ_MODEL",
-        "models": [
-            "openai/gpt-oss-120b",
-            "openai/gpt-oss-20b",
-            "qwen/qwen3.6-27b",
-            "moonshotai/kimi-k2-instruct-0905",
-            "llama-3.3-70b-versatile",  # kept as a last-ditch try in case your
-                                         # account still has legacy access
-        ],
-    },
-    {
-        "name": "cerebras",
-        "endpoint": "https://api.cerebras.ai/v1/chat/completions",
-        "api_key_env": "CEREBRAS_API_KEY",
-        "model_env": "CEREBRAS_MODEL",
-        "models": ["llama-3.3-70b", "gpt-oss-120b", "qwen-3-32b"],
-    },
-    {
-        "name": "together",
-        "endpoint": "https://api.together.xyz/v1/chat/completions",
-        "api_key_env": "TOGETHER_API_KEY",
-        "model_env": "TOGETHER_MODEL",
-        "models": [
-            "meta-llama/Llama-3.3-70B-Instruct-Turbo",
-            "openai/gpt-oss-120b",
-            "Qwen/Qwen2.5-72B-Instruct-Turbo",
-        ],
-    },
-    {
-        "name": "fireworks",
-        "endpoint": "https://api.fireworks.ai/inference/v1/chat/completions",
-        "api_key_env": "FIREWORKS_API_KEY",
-        "model_env": "FIREWORKS_MODEL",
-        "models": [
-            "accounts/fireworks/models/llama-v3p3-70b-instruct",
-            "accounts/fireworks/models/gpt-oss-120b",
-            "accounts/fireworks/models/qwen2p5-72b-instruct",
-        ],
-    },
-    {
-        # OpenRouter fronts dozens of providers behind one key -- these are
-        # its free-tier-friendly, non-gated model slugs.
-        "name": "openrouter",
-        "endpoint": "https://openrouter.ai/api/v1/chat/completions",
-        "api_key_env": "OPENROUTER_API_KEY",
-        "model_env": "OPENROUTER_MODEL",
-        "models": [
-            "openai/gpt-oss-120b",
-            "meta-llama/llama-3.3-70b-instruct",
-            "qwen/qwen-2.5-72b-instruct",
-        ],
-    },
-    {
-        "name": "deepseek",
-        "endpoint": "https://api.deepseek.com/chat/completions",
-        "api_key_env": "DEEPSEEK_API_KEY",
-        "model_env": "DEEPSEEK_MODEL",
-        "models": ["deepseek-chat", "deepseek-reasoner"],
-    },
-    {
-        "name": "openai",
-        "endpoint": "https://api.openai.com/v1/chat/completions",
-        "api_key_env": "OPENAI_API_KEY",
-        "model_env": "OPENAI_MODEL",
-        "models": ["gpt-4o-mini", "gpt-4o", "gpt-oss-120b"],
-    },
-]
+def _build_llm_providers():
+    """Builds the provider list fresh from the CURRENT OLLAMA_BASE_URL /
+    OLLAMA_MODEL globals every time it's called, instead of freezing them
+    at import time. This is what makes _refresh_groq_env() actually work
+    as documented -- without this, a .env edit or a different host picked
+    up mid-session would update the globals but every real HTTP call
+    would keep silently hitting the stale endpoint/model baked into a
+    module-load-time list."""
+    return [
+        {
+            # Local Ollama server (reached over Tailscale), speaking Ollama's
+            # OpenAI-compatible /v1/chat/completions endpoint. No API key --
+            # api_key_env is None, which the code below treats as "always
+            # configured, no Authorization header needed."
+            "name": "ollama",
+            "endpoint": f"{OLLAMA_BASE_URL}/v1/chat/completions",
+            "api_key_env": None,
+            "model_env": "OLLAMA_MODEL",
+            "models": [OLLAMA_MODEL],
+        },
+    ]
+
+
+# Kept as a plain name for any code that still refers to LLM_PROVIDERS
+# directly -- but this is a *snapshot*, not the source of truth. Every
+# call site that matters (_configured_providers, llm_provider_diagnostic)
+# calls _build_llm_providers() itself so it always sees the live config.
+LLM_PROVIDERS = _build_llm_providers()
 
 _PROVIDER_RATE_LIMITERS = {}
 _PROVIDER_STATE_LOCK = threading.Lock()
@@ -460,11 +393,16 @@ def _build_candidate_chain():
 
 
 def _configured_providers():
-    """Returns LLM_PROVIDERS filtered down to the ones that actually have
-    an API key set right now, in fallback order (Groq first)."""
+    """Returns LLM_PROVIDERS filtered down to the ones that are usable
+    right now: providers with api_key_env=None (local/no-auth, like our
+    Ollama server) are always considered configured; any others still
+    need a real key present in the environment."""
     global _ACTIVE_PROVIDERS
     active = []
-    for p in LLM_PROVIDERS:
+    for p in _build_llm_providers():
+        if p["api_key_env"] is None:
+            active.append(p)
+            continue
         key = os.environ.get(p["api_key_env"], "").strip()
         if key and key not in ("PASTE_YOUR_GROQ_API_KEY_HERE", "paste"):
             active.append(p)
@@ -472,75 +410,22 @@ def _configured_providers():
     return active
 
 
-_PASTED_KEY_ENV_VAR_NAMES = {p["api_key_env"] for p in LLM_PROVIDERS}
+_PASTED_KEY_ENV_VAR_NAMES = {p["api_key_env"] for p in LLM_PROVIDERS if p["api_key_env"] is not None}
 
 
 def _detect_provider_for_raw_key(key):
-    """Best-effort guess at which provider a bare pasted key belongs to,
-    based on well-known key-prefix conventions. Returns a provider dict
-    from LLM_PROVIDERS, or None if the key doesn't match any known
-    pattern. (Together's keys are unprefixed hex -- told apart from a
-    random hex string only by length, so a genuinely unrecognizable line
-    is left alone rather than guessed wrong.)"""
-    k = key.strip()
-    if not k:
-        return None
-    prefix_map = [
-        ("gsk_", "groq"),
-        ("csk-", "cerebras"),
-        ("fw_", "fireworks"),
-        ("sk-or-", "openrouter"),
-    ]
-    for prefix, name in prefix_map:
-        if k.startswith(prefix):
-            return next(p for p in LLM_PROVIDERS if p["name"] == name)
-    if k.startswith("sk-proj-"):
-        return next(p for p in LLM_PROVIDERS if p["name"] == "openai")
-    if k.startswith("sk-"):
-        # OpenAI (classic) and DeepSeek both use a bare "sk-" prefix --
-        # DeepSeek keys run ~35-40 chars total, classic OpenAI keys ~51+.
-        want = "deepseek" if len(k) <= 45 else "openai"
-        return next(p for p in LLM_PROVIDERS if p["name"] == want)
-    if re.fullmatch(r"[0-9a-fA-F]{48,80}", k):
-        # Together.ai keys: long unprefixed hex string.
-        return next(p for p in LLM_PROVIDERS if p["name"] == "together")
+    """No-op now that the only configured provider is the local Ollama
+    server (no API key needed). Kept as a stub so any leftover call
+    sites don't blow up; always returns None."""
     return None
 
 
 def _assign_pasted_keys(raw_text):
-    """Parses pasted text -- one key per line, or KEY=VALUE .env-style
-    lines, in any mix and any order -- auto-detects each bare key's
-    provider by prefix, and assigns it straight into os.environ for this
-    process (nothing is written to disk, so a broken .env is a non-issue).
-    Returns (assigned, unrecognized): assigned is a list of
-    (provider_name, env_var_name) tuples in the order they were set;
-    unrecognized is the raw lines that didn't match anything."""
-    assigned = []
-    unrecognized = []
-    for raw_line in raw_text.splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith("export "):
-            line = line[len("export "):].strip()
-
-        if "=" in line:
-            left, _, right = line.partition("=")
-            left = left.strip()
-            right = right.strip().strip('"').strip("'")
-            if left in _PASTED_KEY_ENV_VAR_NAMES and right:
-                os.environ[left] = right
-                provider = next(p for p in LLM_PROVIDERS if p["api_key_env"] == left)
-                assigned.append((provider["name"], left))
-                continue
-
-        provider = _detect_provider_for_raw_key(line)
-        if provider:
-            os.environ[provider["api_key_env"]] = line
-            assigned.append((provider["name"], provider["api_key_env"]))
-        else:
-            unrecognized.append(line)
-    return assigned, unrecognized
+    """No-op now that the only configured provider is the local Ollama
+    server (no API key needed). Kept as a stub, with the same
+    (assigned, unrecognized) return shape, so any leftover call sites
+    don't blow up."""
+    return [], []
 
 
 def reset_provider_fallback_state():
@@ -561,11 +446,15 @@ def llm_provider_diagnostic():
     "Check API Key" button and the CLI's startup check, and folded into
     the error raised when every combo in the whole chain has failed."""
     lines = ["LLM provider + model fallback chain (tried in this order):"]
-    any_key = False
-    for p in LLM_PROVIDERS:
+    for p in _build_llm_providers():
+        if p["api_key_env"] is None:
+            lines.append(f"  - {p['name']} [{p['endpoint']}]: local server, no API key needed")
+            for m in _models_for(p):
+                dead_note = "  -- marked DEAD this run" if (p["name"], m) in _DEAD_COMBOS else ""
+                lines.append(f"      · {m}{dead_note}")
+            continue
         key = os.environ.get(p["api_key_env"], "").strip()
         if key:
-            any_key = True
             masked = key[:4] + "…" + key[-4:] if len(key) > 10 else "(short key)"
             lines.append(f"  - {p['name']} [{p['api_key_env']}]: set ({masked})")
             for m in _models_for(p):
@@ -573,14 +462,6 @@ def llm_provider_diagnostic():
                 lines.append(f"      · {m}{dead_note}")
         else:
             lines.append(f"  - {p['name']} [{p['api_key_env']}]: not set")
-    if not any_key:
-        lines.append("")
-        lines.append("No provider API keys are set at all. At minimum, set GROQ_API_KEY "
-                      f"(env var or .env file at {ENV_DEBUG['env_path']}).")
-        lines.append("Optionally add any of: CEREBRAS_API_KEY, TOGETHER_API_KEY, "
-                      "FIREWORKS_API_KEY, OPENROUTER_API_KEY, DEEPSEEK_API_KEY, OPENAI_API_KEY "
-                      "-- deepship will fall back to whichever of those is configured "
-                      "automatically if Groq (or a given model on it) runs out.")
     return "\n".join(lines)
 
 
@@ -640,21 +521,33 @@ def _call_llm_once(provider, model, messages, temperature, max_tokens, log, max_
     GroqCallError for anything else that didn't recover within
     max_retries."""
 
+    def _ts():
+        return datetime.now().strftime("%H:%M:%S.%f")[:-3]
+
     def _log(msg):
+        # Timestamp every line and hand it to whatever sink was passed in
+        # (CLI's console log(), or the GUI's _forward_log -- both now print
+        # immediately with flush=True, see below, so this is "live" in
+        # both modes without double-printing).
         if log:
-            log(msg)
+            log(f"[{_ts()}] {msg}")
 
-    api_key = os.environ.get(provider["api_key_env"], "").strip()
-    if not api_key:
-        raise ProviderAuthError(f"{provider['name']}: no API key set ({provider['api_key_env']}).")
-
-    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
+    headers = {"Content-Type": "application/json"}
+    if provider["api_key_env"] is not None:
+        api_key = os.environ.get(provider["api_key_env"], "").strip()
+        if not api_key:
+            raise ProviderAuthError(f"{provider['name']}: no API key set ({provider['api_key_env']}).")
+        headers["Authorization"] = f"Bearer {api_key}"
     payload = {
         "model": model,
         "temperature": temperature,
         "max_tokens": max_tokens,
         "messages": messages,
     }
+
+    approx_chars = sum(len(m.get("content", "") or "") for m in messages if isinstance(m, dict))
+    _log(f"-> POST {provider['endpoint']}  model={model}  "
+         f"messages={len(messages)}  ~{approx_chars} chars  max_tokens={max_tokens}")
 
     limiter = _rate_limiter_for(provider["name"], model)
     last_exc = None
@@ -663,10 +556,19 @@ def _call_llm_once(provider, model, messages, temperature, max_tokens, log, max_
         limiter.wait_turn(_log)
         try:
             resp = requests.post(provider["endpoint"], headers=headers, json=payload, timeout=GROQ_TIMEOUT_S)
+        except requests.exceptions.ConnectionError as exc:
+            saw_only_429 = False
+            last_exc = GroqCallError(f"{provider['name']}/{model}: connection failed: {exc}")
+            _log(f"  ! {provider['name']}/{model} CONNECTION ERROR (attempt {attempt}/{max_retries}) -- "
+                 f"is {provider['endpoint']} reachable from this machine right now (Tailscale up, "
+                 f"host awake, Ollama running)? {exc}")
+            time.sleep(1.5 * attempt)
+            continue
         except requests.exceptions.Timeout:
             saw_only_429 = False
             last_exc = GroqCallError(f"{provider['name']}/{model}: took too long to respond.")
-            _log(f"  ! {provider['name']}/{model} timeout (attempt {attempt}/{max_retries})")
+            _log(f"  ! {provider['name']}/{model} TIMEOUT after {GROQ_TIMEOUT_S}s (attempt {attempt}/{max_retries}) "
+                 f"-- the model may still be loading into memory on first call, or the chunk is too big.")
             continue
         except requests.exceptions.RequestException as exc:
             saw_only_429 = False
@@ -675,36 +577,54 @@ def _call_llm_once(provider, model, messages, temperature, max_tokens, log, max_
             time.sleep(1.5 * attempt)
             continue
 
+        _log(f"<- HTTP {resp.status_code} from {provider['name']}/{model} "
+             f"({len(resp.content or b'')} bytes)")
+
         if resp.status_code in (401, 403):
+            _log(f"  ! auth error body: {resp.text[:400]}")
             raise ProviderAuthError(f"{provider['name']}: HTTP {resp.status_code} -- {resp.text[:200]}")
 
         if _looks_like_model_unavailable(resp.status_code, resp.text):
             _log(f"  ! {provider['name']}/{model} -- model unavailable "
-                 f"(HTTP {resp.status_code}): {resp.text[:200]}")
+                 f"(HTTP {resp.status_code}): {resp.text[:400]}  "
+                 f"-- on Ollama this usually means the tag isn't pulled on THAT server yet; "
+                 f"run `ollama pull {model}` on the host behind {OLLAMA_BASE_URL}.")
             raise ModelUnavailableError(f"{provider['name']}/{model}: HTTP {resp.status_code} -- {resp.text[:200]}")
 
         if resp.status_code == 429:
             limiter.note_rate_limited(_log)
             last_exc = GroqCallError(f"{provider['name']}/{model} 429: {resp.text[:300]}")
-            _log(f"  ! {provider['name']}/{model} 429 (attempt {attempt}/{max_retries})")
+            _log(f"  ! {provider['name']}/{model} 429 (attempt {attempt}/{max_retries}): {resp.text[:300]}")
             time.sleep(1.0 * attempt)
             continue
 
         if _looks_like_payload_too_large(resp.status_code, resp.text):
             _log(f"  ! {provider['name']}/{model} says payload too large (HTTP {resp.status_code}) "
-                 f"-- caller should clump smaller.")
+                 f"-- caller should clump smaller. body: {resp.text[:300]}")
             raise PayloadTooLargeError(resp.text[:300])
 
         if not resp.ok:
             saw_only_429 = False
+            _log(f"  ! {provider['name']}/{model} error body: {resp.text[:600]}")
             raise GroqCallError(f"{provider['name']}/{model} error: HTTP {resp.status_code} {resp.text[:400]}")
 
         limiter.note_success()
-        data = resp.json()
+        try:
+            data = resp.json()
+        except ValueError as exc:
+            saw_only_429 = False
+            last_exc = GroqCallError(f"{provider['name']}/{model}: response wasn't valid JSON: {exc}")
+            _log(f"  ! {provider['name']}/{model} response wasn't valid JSON. Raw body (first 400 chars): "
+                 f"{resp.text[:400]!r}")
+            continue
         choices = data.get("choices") or []
         if not choices:
+            _log(f"  ! {provider['name']}/{model} returned 200 but no 'choices' in the body: "
+                 f"{json.dumps(data)[:400]}")
             return ""
-        return (choices[0].get("message", {}) or {}).get("content", "") or ""
+        content = (choices[0].get("message", {}) or {}).get("content", "") or ""
+        _log(f"  <- {len(content)} chars of content back from {provider['name']}/{model}")
+        return content
 
     if saw_only_429:
         raise QuotaExhaustedError(
@@ -712,6 +632,189 @@ def _call_llm_once(provider, model, messages, temperature, max_tokens, log, max_
             f"tier (or rate limit) for THIS MODEL is tapped out. {last_exc}"
         )
     raise last_exc or GroqCallError(f"{provider['name']}/{model}: call failed after retries.")
+
+
+def warm_up_model(model=None, log=None):
+    """Sends a tiny, throwaway prompt before the real run starts, purely so
+    Ollama loads the model into memory NOW -- on a request small enough to
+    finish fast -- instead of that one-time load cost getting silently
+    added on top of the first REAL (often much larger) prompt's own
+    processing time, which is what was tripping GROQ_TIMEOUT_S even after
+    raising it. Failures here are logged but never raised; if the server's
+    unreachable, the very next real call will surface that clearly anyway."""
+    def _log(msg):
+        if log:
+            log(msg)
+    if MANUAL_PASTE_MODE:
+        _log("(manual paste mode is on -- skipping model warm-up, nothing to preload.)")
+        return
+    try:
+        _log("(warming up model -- loading it into memory before the real run starts...)")
+        call_groq(
+            [{"role": "user", "content": "Reply with just: ok"}],
+            temperature=0.0, max_tokens=8, model=model, log=log, max_retries=1,
+        )
+        _log("(model warm-up done)")
+    except Exception as exc:
+        _log(f"(model warm-up failed, continuing anyway -- the first real call will retry: {exc})")
+
+
+def _show_manual_paste_dialog(parent, prompt_text, meta_line, result_holder):
+    """Builds and shows the popup, and blocks (via mainloop or
+    wait_window) until the user submits or aborts. MUST be called on the
+    main thread. Writes its outcome into result_holder: either
+    {"text": <pasted response>} or {"aborted": True}."""
+    import tkinter as tk
+    from tkinter import ttk
+
+    BG, BG2, FG = "#14161b", "#1a1d24", "#eef0f4"
+    ACCENT, GREEN, RED = "#33d1ff", "#33ff88", "#ff3b3b"
+
+    own_root = None
+    if parent is None:
+        own_root = tk.Tk()
+        win = own_root
+    else:
+        win = tk.Toplevel(parent)
+        win.transient(parent)
+        win.grab_set()
+
+    win.title("Deepship — paste this into your LLM")
+    win.configure(bg=BG)
+    win.geometry("900x720")
+
+    tk.Label(win, text=meta_line, bg=BG, fg=ACCENT, font=("Consolas", 10, "bold"),
+             anchor="w", justify="left").pack(fill="x", padx=10, pady=(10, 4))
+    tk.Label(win, text="1. Copy this prompt and paste it into your LLM of choice:",
+             bg=BG, fg=FG, anchor="w").pack(fill="x", padx=10)
+
+    prompt_frame = tk.Frame(win, bg=BG)
+    prompt_frame.pack(fill="both", expand=True, padx=10, pady=(4, 4))
+    prompt_scroll = tk.Scrollbar(prompt_frame)
+    prompt_scroll.pack(side="right", fill="y")
+    prompt_box = tk.Text(prompt_frame, wrap="word", height=16, bg=BG2, fg=FG,
+                          insertbackground=FG, font=("Consolas", 10),
+                          yscrollcommand=prompt_scroll.set)
+    prompt_box.pack(side="left", fill="both", expand=True)
+    prompt_scroll.configure(command=prompt_box.yview)
+    prompt_box.insert("1.0", prompt_text)
+    prompt_box.configure(state="disabled")
+
+    def _copy():
+        win.clipboard_clear()
+        win.clipboard_append(prompt_text)
+        copy_btn.configure(text="Copied to clipboard ✓")
+        win.after(1200, lambda: copy_btn.configure(text="Copy prompt"))
+
+    copy_btn = tk.Button(win, text="Copy prompt", command=_copy, bg=ACCENT, fg="#0a0b0d",
+                          relief="flat", padx=12, pady=4, cursor="hand2")
+    copy_btn.pack(padx=10, pady=(0, 10), anchor="e")
+
+    ttk.Separator(win, orient="horizontal").pack(fill="x", padx=10, pady=4)
+
+    tk.Label(win, text="2. Paste the LLM's response below, then click Submit:",
+             bg=BG, fg=FG, anchor="w").pack(fill="x", padx=10, pady=(6, 4))
+
+    resp_frame = tk.Frame(win, bg=BG)
+    resp_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+    resp_scroll = tk.Scrollbar(resp_frame)
+    resp_scroll.pack(side="right", fill="y")
+    response_box = tk.Text(resp_frame, wrap="word", height=12, bg=BG2, fg=FG,
+                            insertbackground=FG, font=("Consolas", 10),
+                            yscrollcommand=resp_scroll.set)
+    response_box.pack(side="left", fill="both", expand=True)
+    resp_scroll.configure(command=response_box.yview)
+    response_box.focus_set()
+
+    btn_row = tk.Frame(win, bg=BG)
+    btn_row.pack(fill="x", padx=10, pady=(0, 10))
+
+    def _close():
+        if own_root is not None:
+            own_root.destroy()
+        else:
+            win.grab_release()
+            win.destroy()
+
+    def _submit():
+        text = response_box.get("1.0", "end-1c").strip()
+        if not text:
+            orig = response_box.cget("bg")
+            response_box.configure(bg="#3a1a1a")
+            win.after(300, lambda: response_box.configure(bg=orig))
+            return
+        result_holder["text"] = text
+        _close()
+
+    def _abort():
+        result_holder["aborted"] = True
+        _close()
+
+    tk.Button(btn_row, text="Abort run", command=_abort, bg=RED, fg="white",
+              relief="flat", padx=12, pady=6, cursor="hand2").pack(side="left")
+    tk.Button(btn_row, text="Submit response", command=_submit, bg=GREEN, fg="#0a0b0d",
+              relief="flat", padx=16, pady=6, cursor="hand2").pack(side="right")
+
+    win.protocol("WM_DELETE_WINDOW", _abort)
+    win.bind("<Control-Return>", lambda e: _submit())
+
+    if own_root is not None:
+        own_root.mainloop()
+    else:
+        parent.wait_window(win)
+
+
+def manual_paste_call(messages, provider_label="manual", model_label="paste-mode", log=None):
+    """The manual-paste-mode replacement for an actual LLM API call.
+    Formats `messages` into one big prompt block, pops up a window with a
+    Copy button so you can paste it into whatever LLM UI you want, and
+    blocks until you paste the reply back and hit Submit (or Abort).
+    Safe to call from the CLI's main thread OR the GUI's background
+    crawler thread -- when a GUI is running (_GUI_ROOT is set) and this is
+    called off the main thread, the popup is built on the main thread via
+    root.after() and this function blocks on a threading.Event instead of
+    touching Tkinter directly."""
+
+    def _log(msg):
+        if log:
+            log(msg)
+
+    parts = []
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        role = (m.get("role") or "user").upper()
+        parts.append(f"===== {role} =====\n{m.get('content', '')}")
+    prompt_text = "\n\n".join(parts)
+    meta_line = (f"[{provider_label}/{model_label}]  {len(messages)} message(s), "
+                 f"~{len(prompt_text)} chars -- copy below, paste your LLM's reply, Submit")
+
+    _log(f"-> MANUAL PASTE MODE: opening popup, waiting for you to paste a response "
+         f"({len(prompt_text)} chars prompt)")
+
+    result = {}
+    root = _GUI_ROOT
+    if root is not None and threading.current_thread() is not threading.main_thread():
+        done = threading.Event()
+
+        def _run_on_main():
+            try:
+                _show_manual_paste_dialog(root, prompt_text, meta_line, result)
+            finally:
+                done.set()
+
+        root.after(0, _run_on_main)
+        done.wait()
+    else:
+        _show_manual_paste_dialog(root, prompt_text, meta_line, result)
+
+    if result.get("aborted"):
+        _log("  ! manual paste dialog aborted by user -- stopping run.")
+        raise StopRequested("User clicked Abort in the manual paste dialog.")
+
+    text = result.get("text", "")
+    _log(f"  <- got {len(text)} chars pasted back in.")
+    return text
 
 
 def call_groq(messages, temperature=0.1, max_tokens=2000, model=None, log=None, max_retries=3):
@@ -750,6 +853,10 @@ def call_groq(messages, temperature=0.1, max_tokens=2000, model=None, log=None, 
     def _log(msg):
         if log:
             log(msg)
+
+    if MANUAL_PASTE_MODE:
+        return manual_paste_call(messages, provider_label="manual-paste",
+                                  model_label=(model or OLLAMA_MODEL), log=log)
 
     chain = _build_candidate_chain()
     if model:
@@ -792,6 +899,8 @@ def call_groq(messages, temperature=0.1, max_tokens=2000, model=None, log=None, 
             _DEAD_COMBOS.discard((p["name"], m))
             if i > 0:
                 _log(f"  -> fell back to {p['name']}/{m} for this call.")
+            else:
+                _log(f"  -> using {p['name']}/{m}")
             return content
         except PayloadTooLargeError:
             raise
@@ -1729,6 +1838,17 @@ class DeepshipCrawler:
         self._stop = threading.Event()
         self._thread = None
 
+    def _forward_log(self, msg):
+        # Every provider/model/HTTP-error message call_groq() and
+        # _call_llm_once() produce -- previously passed log=None here and
+        # silently dropped in the GUI -- now reaches the live log panel.
+        # Also echoed straight to the console (flushed immediately) so if
+        # you're running the GUI from a terminal you see every request/
+        # response line live there too, not just in the "Groq's Response"
+        # pane.
+        print(msg, flush=True)
+        self.on_event("log_line", text=msg)
+
     def start_batch(self, domains):
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, args=(list(domains),), daemon=True)
@@ -1740,6 +1860,7 @@ class DeepshipCrawler:
     def _run(self, domains):
         total = len(domains)
         self.on_event("run_start", total=total)
+        warm_up_model(model=self.model, log=self._forward_log)
         total_scholarships = 0
         stopped_early = False
         for i, domain in enumerate(domains):
@@ -1749,7 +1870,7 @@ class DeepshipCrawler:
             try:
                 result = process_college(
                     domain, max_candidates=self.max_candidates, model=self.model,
-                    log=None, on_event=self.on_event, stop_flag=self._stop,
+                    log=self._forward_log, on_event=self.on_event, stop_flag=self._stop,
                     index=i, total=total,
                 )
                 total_scholarships += sum(len(p.get("scholarships", [])) for p in result.get("pages", []))
@@ -1781,9 +1902,34 @@ def _run_gui():
     GREEN = "#33ff88"
     RED = "#ff3b3b"
     BORDER = "#2a2e37"
+    BLUE = "#5b8cff"
+    PINK = "#ff6bd6"
+    GREY = "#9aa5b8"
+
+    # The seven stages of the pipeline (per docstring at top of file), in
+    # the order they fire for a given page/college -- drives the full-width
+    # stage tracker bar at the top of the window. "fetch"/"pass1"/"pass2"
+    # repeat once per candidate page; "pass3"/"pass4" run once per college
+    # after all its pages are done.
+    STAGE_ORDER = ["crawl", "triage", "fetch", "pass1", "pass2", "pass3", "pass4"]
+    # Boxes actually drawn in the pipeline bar -- crawl/triage/fetch still run
+    # and still fire all their events exactly as before (see STAGE_ORDER above
+    # and every _advance_stage("crawl"/"triage"/"fetch") call below); they just
+    # have no visible box to light up, so those calls become harmless no-ops.
+    VISIBLE_STAGE_ORDER = ["pass1", "pass2", "pass3", "pass4"]
+    STAGE_META = {
+        "crawl":  {"label": "Crawl",             "color": ACCENT_CYAN,  "idle": "waiting…"},
+        "triage": {"label": "Triage",            "color": ACCENT_PURPLE,"idle": "waiting…"},
+        "fetch":  {"label": "Fetch Page",        "color": ACCENT_AMBER, "idle": "waiting…"},
+        "pass1":  {"label": "Pass 1 · Sweep",    "color": GREEN,        "idle": "waiting…"},
+        "pass2":  {"label": "Pass 2 · Structure","color": BLUE,         "idle": "waiting…"},
+        "pass3":  {"label": "Pass 3 · FAQ",      "color": PINK,         "idle": "waiting…"},
+        "pass4":  {"label": "Pass 4 · Regex",    "color": GREY,         "idle": "waiting…"},
+    }
 
     MAX_TEXT_PREVIEW_CHARS = 20000
     MAX_LOG_LINES = 2000
+    STAGE_MAX_LINES = 400  # per stage-box text widget; trimmed from the top
 
     def _paste_keys_popup():
         """Startup popup, shown before the main window: paste any number
@@ -1867,11 +2013,17 @@ def _run_gui():
                 "provider key format, so nothing was assigned. Continuing anyway -- use "
                 "'Check API Key' in the main window if the crawl fails to start.")
 
-    _paste_keys_popup()
+    # No API key needed for the local Ollama server, so the old
+    # paste-your-cloud-API-keys startup popup is skipped entirely.
+    # _paste_keys_popup() is kept above (unused) in case a cloud
+    # provider is ever wired back in.
 
     class App(tk.Tk):
         def __init__(self):
             super().__init__()
+            global _GUI_ROOT
+            _GUI_ROOT = self  # lets manual-paste popups triggered from the
+                               # background crawler thread build safely here
             self.title("Deepship — College Financial Aid Crawler")
             self.configure(bg=BG_DARK)
             try:
@@ -1897,7 +2049,7 @@ def _run_gui():
             self.domains_var = tk.StringVar()
             self.fetch_n_var = tk.IntVar(value=5)
             self.max_candidates_var = tk.IntVar(value=DEFAULT_MAX_CANDIDATES)
-            self.model_var = tk.StringVar(value=GROQ_MODEL)
+            self.model_var = tk.StringVar(value=OLLAMA_MODEL)
 
             self._build_widgets()
             self._domains_text.insert("1.0", "\n".join(DEFAULT_SAMPLE_COLLEGES))
@@ -1936,59 +2088,85 @@ def _run_gui():
         # ---------------- layout ----------------
 
         def _build_widgets(self):
-            top = tk.Frame(self, bg=BG_DARK, padx=8, pady=6)
+            # Everything above the pipeline/content split lives in ONE
+            # compact horizontal strip now instead of three stacked rows --
+            # domains+buttons+options on the left, controls/provider/stats
+            # sideways to the right, all in a single slim bar.
+            top = tk.Frame(self, bg=BG_DARK, padx=8, pady=3)
             top.pack(fill="x")
 
-            tk.Label(top, text="Colleges (one domain per line):", bg=BG_DARK, fg=ACCENT_PURPLE).grid(
-                row=0, column=0, sticky="nw")
-            self._domains_text = tk.Text(top, height=4, width=42, bg=BG_PANEL2, fg=FG_BRIGHT,
+            tk.Label(top, text="Colleges:", bg=BG_DARK, fg=ACCENT_PURPLE,
+                     font=("TkDefaultFont", 8, "bold")).grid(row=0, column=0, sticky="nw")
+            self._domains_text = tk.Text(top, height=2, width=34, bg=BG_PANEL2, fg=FG_BRIGHT,
                                           insertbackground=FG_BRIGHT, bd=0, highlightthickness=1,
-                                          highlightbackground=BORDER, font=("Consolas", 9))
-            self._domains_text.grid(row=0, column=1, rowspan=3, padx=6, sticky="w")
+                                          highlightbackground=BORDER, font=("Consolas", 8))
+            self._domains_text.grid(row=0, column=1, padx=4, sticky="w")
 
             btns = tk.Frame(top, bg=BG_DARK)
-            btns.grid(row=0, column=2, rowspan=3, sticky="nw", padx=(6, 0))
-            ttk.Button(btns, text="Load from file…", command=self._on_load_file).pack(anchor="w", pady=1)
-            ttk.Button(btns, text="Reset to sample list", command=self._on_reset_sample).pack(anchor="w", pady=1)
+            btns.grid(row=0, column=2, sticky="nw", padx=(6, 0))
+            ttk.Button(btns, text="Load file…", command=self._on_load_file).pack(anchor="w")
 
             opts = tk.Frame(top, bg=BG_DARK)
-            opts.grid(row=0, column=3, rowspan=3, sticky="nw", padx=(20, 0))
-
-            tk.Label(opts, text="Fetch first N colleges:", bg=BG_DARK, fg=ACCENT_AMBER).grid(
+            opts.grid(row=0, column=3, sticky="nw", padx=(14, 0))
+            tk.Label(opts, text="Fetch N:", bg=BG_DARK, fg=ACCENT_AMBER, font=("TkDefaultFont", 8)).grid(
                 row=0, column=0, sticky="w")
-            ttk.Spinbox(opts, from_=1, to=500, textvariable=self.fetch_n_var, width=5).grid(
-                row=0, column=1, sticky="w", padx=(4, 0))
+            ttk.Spinbox(opts, from_=1, to=500, textvariable=self.fetch_n_var, width=4).grid(
+                row=0, column=1, sticky="w", padx=(3, 10))
+            tk.Label(opts, text="Candidates/college:", bg=BG_DARK, fg=ACCENT_AMBER, font=("TkDefaultFont", 8)).grid(
+                row=0, column=2, sticky="w")
+            ttk.Spinbox(opts, from_=1, to=10, textvariable=self.max_candidates_var, width=4).grid(
+                row=0, column=3, sticky="w", padx=(3, 10))
+            tk.Label(opts, text="Model override:", bg=BG_DARK, fg=ACCENT_AMBER, font=("TkDefaultFont", 8)).grid(
+                row=0, column=4, sticky="w")
+            ttk.Entry(opts, textvariable=self.model_var, width=18).grid(
+                row=0, column=5, sticky="w", padx=(3, 0))
+            tk.Label(opts, text="(blank = each provider's own fallback list)",
+                     bg=BG_DARK, fg=FG_DIM, font=("TkDefaultFont", 7)).grid(
+                row=1, column=0, columnspan=6, sticky="w")
 
-            tk.Label(opts, text="Candidate pages/college:", bg=BG_DARK, fg=ACCENT_AMBER).grid(
-                row=1, column=0, sticky="w", pady=(4, 0))
-            ttk.Spinbox(opts, from_=1, to=10, textvariable=self.max_candidates_var, width=5).grid(
-                row=1, column=1, sticky="w", padx=(4, 0), pady=(4, 0))
+            def _sep(parent):
+                tk.Frame(parent, width=1, bg=BORDER).pack(side="left", fill="y", padx=8, pady=2)
 
-            tk.Label(opts, text="Model override:", bg=BG_DARK, fg=ACCENT_AMBER).grid(
-                row=2, column=0, sticky="w", pady=(4, 0))
-            ttk.Entry(opts, textvariable=self.model_var, width=24).grid(
-                row=2, column=1, sticky="w", padx=(4, 0), pady=(4, 0))
-            tk.Label(opts, text="(optional -- pins the first model tried on every provider; "
-                                 "leave blank to use each provider's own model fallback list)",
-                     bg=BG_DARK, fg=FG_DIM, font=("Segoe UI", 8)).grid(
-                row=3, column=0, columnspan=2, sticky="w")
+            ctrl = tk.Frame(self, bg=BG_PANEL, padx=8, pady=4, highlightthickness=1, highlightbackground=BORDER)
+            ctrl.pack(fill="x", padx=8, pady=(3, 0))
 
-            ctrl = tk.Frame(self, bg=BG_DARK, padx=8)
-            ctrl.pack(fill="x")
-            self.start_btn = ttk.Button(ctrl, text="▶ Start Crawl", style="Start.TButton",
+            self.start_btn = ttk.Button(ctrl, text="▶ Start", style="Start.TButton",
                                          command=self._on_start_clicked)
             self.start_btn.pack(side="left")
             self.stop_btn = ttk.Button(ctrl, text="■ Stop", style="Stop.TButton",
                                         command=self._on_stop_clicked, state="disabled")
-            self.stop_btn.pack(side="left", padx=4)
-            ttk.Button(ctrl, text="🔑 Check API Key", command=self._on_check_key_clicked).pack(side="left", padx=4)
-            self.pipe_status = tk.Label(ctrl, text="Ready", bg=BG_DARK, fg=FG_BRIGHT, font=("TkDefaultFont", 10))
-            self.pipe_status.pack(side="left", padx=16)
+            self.stop_btn.pack(side="left", padx=3)
+            ttk.Button(ctrl, text="🔑 Check Key", command=self._on_check_key_clicked).pack(side="left", padx=3)
+            ttk.Button(ctrl, text="🔍 Preview Data", command=self._on_preview_data).pack(side="left", padx=3)
+            _sep(ctrl)
+            self.pipe_status = tk.Label(ctrl, text="Ready", bg=BG_PANEL, fg=FG_BRIGHT, font=("TkDefaultFont", 9))
+            self.pipe_status.pack(side="left")
+            _sep(ctrl)
+            tk.Label(ctrl, text="Using:", bg=BG_PANEL, fg=FG_DIM, font=("TkDefaultFont", 8)).pack(side="left")
+            self.provider_status_var = tk.StringVar(value="—")
+            tk.Label(ctrl, textvariable=self.provider_status_var, bg=BG_PANEL, fg=ACCENT_AMBER,
+                     font=("TkDefaultFont", 9, "bold")).pack(side="left", padx=(4, 0))
+            _sep(ctrl)
 
-            self._build_stats_bar()
+            self._build_stats_bar(ctrl, _sep)
 
-            outer = tk.PanedWindow(self, orient="horizontal", sashwidth=6, bg=BG_DARK, sashrelief="flat", bd=0)
-            outer.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+            # Top half: the pipeline boxes (big, live text per stage).
+            # Bottom half: everything else, rearranged to fit underneath.
+            # A vertical PanedWindow keeps the split roughly 50/50 but still
+            # user-draggable.
+            main_pane = tk.PanedWindow(self, orient="vertical", sashwidth=6,
+                                        bg=BG_DARK, sashrelief="flat", bd=0)
+            main_pane.pack(fill="both", expand=True, padx=8, pady=(4, 8))
+
+            pipeline_pane = tk.Frame(main_pane, bg=BG_DARK)
+            content_pane = tk.Frame(main_pane, bg=BG_DARK)
+            main_pane.add(pipeline_pane, stretch="always")
+            main_pane.add(content_pane, stretch="always")
+
+            self._build_stage_bar(pipeline_pane)
+
+            outer = tk.PanedWindow(content_pane, orient="horizontal", sashwidth=6, bg=BG_DARK, sashrelief="flat", bd=0)
+            outer.pack(fill="both", expand=True)
 
             left_col = tk.PanedWindow(outer, orient="vertical", sashwidth=6, bg=BG_DARK, sashrelief="flat", bd=0)
             right_col = tk.PanedWindow(outer, orient="vertical", sashwidth=6, bg=BG_DARK, sashrelief="flat", bd=0)
@@ -1997,8 +2175,10 @@ def _run_gui():
 
             site_frame = tk.Frame(left_col, bg=BG_DARK)
             links_frame = tk.Frame(left_col, bg=BG_DARK)
+            log_frame = tk.Frame(left_col, bg=BG_DARK)
             left_col.add(site_frame, stretch="always")
             left_col.add(links_frame, stretch="always")
+            left_col.add(log_frame, stretch="always")
 
             text_frame = tk.Frame(right_col, bg=BG_DARK)
             groq_frame = tk.Frame(right_col, bg=BG_DARK)
@@ -2007,35 +2187,235 @@ def _run_gui():
 
             self._build_site_pane(site_frame)
             self._build_links_pane(links_frame)
+            self._build_provider_log_pane(log_frame)
             self._build_text_pane(text_frame)
             self._build_groq_pane(groq_frame)
 
-        def _build_stats_bar(self):
-            bar = tk.Frame(self, bg=BG_PANEL, padx=10, pady=6, highlightthickness=1, highlightbackground=BORDER)
-            bar.pack(fill="x", padx=8, pady=(4, 0))
+            # Force the pipeline/content split to ~half-and-half once the
+            # window has actually been laid out (sizes aren't known yet on
+            # the same tick this widget tree gets built).
+            def _split_evenly():
+                main_pane.update_idletasks()
+                h = main_pane.winfo_height()
+                if h > 100:
+                    main_pane.sash_place(0, 0, h // 2)
+            self.after(150, _split_evenly)
+
+        # ---------------- pipeline stage tracker (full width, top) ----------------
+
+        def _build_stage_bar(self, parent):
+            tk.Label(parent, text="PIPELINE — live text as each pass processes it",
+                     bg=BG_DARK, fg=FG_DIM, font=("TkDefaultFont", 9, "bold")).pack(
+                anchor="w", padx=10, pady=(4, 2))
+
+            row = tk.Frame(parent, bg=BG_DARK)
+            row.pack(fill="both", expand=True, padx=8, pady=(0, 6))
+
+            self._stage_boxes = {}
+            ncols = len(VISIBLE_STAGE_ORDER) * 2 - 1
+            for col in range(ncols):
+                row.grid_columnconfigure(col, weight=(1 if col % 2 == 0 else 0))
+            row.grid_rowconfigure(0, weight=1)
+
+            for i, stage_id in enumerate(VISIBLE_STAGE_ORDER):
+                meta = STAGE_META[stage_id]
+                col = i * 2
+
+                cell = tk.Frame(row, bg=BG_DARK)
+                cell.grid(row=0, column=col, sticky="nsew", padx=3)
+                cell.grid_rowconfigure(1, weight=1)
+                cell.grid_columnconfigure(0, weight=1)
+
+                top_bar = tk.Frame(cell, height=6, bg=BORDER)
+                top_bar.grid(row=0, column=0, sticky="ew")
+
+                body = tk.Frame(cell, bg=BG_PANEL, highlightthickness=2, highlightbackground=BORDER)
+                body.grid(row=1, column=0, sticky="nsew", pady=(2, 0))
+                body.grid_rowconfigure(1, weight=1)
+                body.grid_columnconfigure(0, weight=1)
+
+                header = tk.Frame(body, bg=BG_PANEL)
+                header.grid(row=0, column=0, sticky="ew", padx=6, pady=(6, 2))
+                dot = tk.Label(header, text="○", bg=BG_PANEL, fg=FG_DIM, font=("TkDefaultFont", 12))
+                dot.pack(side="left")
+                name = tk.Label(header, text=meta["label"], bg=BG_PANEL, fg=FG_DIM,
+                                 font=("TkDefaultFont", 10, "bold"))
+                name.pack(side="left", padx=(5, 0))
+                result = tk.Label(header, text=meta["idle"], bg=BG_PANEL, fg=FG_DIM,
+                                   font=("TkDefaultFont", 8), wraplength=150, justify="left")
+                result.pack(side="left", padx=(6, 0))
+
+                text_wrap = tk.Frame(body, bg=BG_PANEL)
+                text_wrap.grid(row=1, column=0, sticky="nsew", padx=4, pady=(0, 5))
+                text_wrap.grid_rowconfigure(0, weight=1)
+                text_wrap.grid_columnconfigure(0, weight=1)
+
+                text_widget = tk.Text(text_wrap, bg=BG_PANEL2, fg=FG_DIM, bd=0, wrap="word",
+                                       font=("Consolas", 8), state="disabled", highlightthickness=0)
+                text_widget.grid(row=0, column=0, sticky="nsew")
+                sb = ttk.Scrollbar(text_wrap, orient="vertical", command=text_widget.yview)
+                sb.grid(row=0, column=1, sticky="ns")
+                text_widget.configure(yscrollcommand=sb.set)
+
+                self._stage_boxes[stage_id] = {
+                    "top_bar": top_bar, "body": body, "dot": dot, "name": name,
+                    "result": result, "text": text_widget, "color": meta["color"],
+                }
+
+                if i < len(VISIBLE_STAGE_ORDER) - 1:
+                    tk.Label(row, text="→", bg=BG_DARK, fg=FG_DIM,
+                             font=("TkDefaultFont", 16)).grid(row=0, column=col + 1)
+
+            self._reset_stage_bar()
+
+        def _set_stage_visual(self, stage_id, state):
+            """Two real states: "active" (lit, in this stage's color) and
+            everything else, which always renders as the same neutral,
+            unlit look -- a stage never stays lit just because it already
+            ran. Only the stage doing work right now is ever lit."""
+            box = self._stage_boxes.get(stage_id)
+            if not box:
+                return
+            color = box["color"]
+            if state == "active":
+                box["top_bar"].configure(bg=color)
+                box["body"].configure(highlightbackground=color)
+                box["dot"].configure(text="●", fg=color)
+                box["name"].configure(fg=color)
+            elif state == "error":
+                box["top_bar"].configure(bg=RED)
+                box["body"].configure(highlightbackground=RED)
+                box["dot"].configure(text="✗", fg=RED)
+                box["name"].configure(fg=RED)
+            else:  # idle
+                box["top_bar"].configure(bg=BORDER)
+                box["body"].configure(highlightbackground=BORDER)
+                box["dot"].configure(text="○", fg=FG_DIM)
+                box["name"].configure(fg=FG_DIM)
+
+        def _set_stage_result(self, stage_id, text):
+            """Updates the small running-tally line in a stage's header."""
+            box = self._stage_boxes.get(stage_id)
+            if box:
+                box["result"].configure(text=text)
+
+        def _append_stage_text(self, stage_id, text):
+            """Appends the actual raw text this stage just processed into
+            its own box, live -- trimmed from the top once it gets long so
+            a long run doesn't grow these unbounded."""
+            box = self._stage_boxes.get(stage_id)
+            if not box or not text:
+                return
+            widget = box["text"]
+            widget.configure(state="normal")
+            widget.insert("end", text.rstrip("\n") + "\n\n")
+            line_count = int(widget.index("end-1c").split(".")[0])
+            if line_count > STAGE_MAX_LINES:
+                widget.delete("1.0", f"{line_count - STAGE_MAX_LINES}.0")
+            widget.see("end")
+            widget.configure(state="disabled")
+
+        def _advance_stage(self, stage_id):
+            """Lights up only `stage_id`; every other box drops back to its
+            neutral idle look, so exactly one box is ever lit at a time --
+            whichever stage is actively doing work -- rather than stages
+            staying lit once they're passed."""
+            if stage_id not in STAGE_ORDER:
+                return
+            for sid in STAGE_ORDER:
+                self._set_stage_visual(sid, "active" if sid == stage_id else "idle")
+
+        def _reset_stage_bar(self):
+            for sid in STAGE_ORDER:
+                self._set_stage_visual(sid, "idle")
+            self._reset_stage_counts()
+
+        def _reset_stage_counts(self):
+            # Running totals for the whole scan (not per-page/per-college) --
+            # these accumulate across the run so each box's tally only ever
+            # grows, tracking the complete picture as it fills in.
+            self._stage_counts = {sid: 0 for sid in STAGE_ORDER}
+            self._pass4_flagged_count = 0
+            for sid in STAGE_ORDER:
+                self._set_stage_result(sid, STAGE_META[sid]["idle"])
+                box = self._stage_boxes.get(sid)
+                if box:
+                    box["text"].configure(state="normal")
+                    box["text"].delete("1.0", "end")
+                    box["text"].configure(state="disabled")
+
+        def _build_stats_bar(self, bar, _sep):
             self.stat_vars = {}
             specs = [
-                ("colleges_done", "colleges done", FG_BRIGHT),
-                ("colleges_total", "colleges queued", FG_DIM),
-                ("links", "links found", ACCENT_CYAN),
+                ("colleges_done", "done", FG_BRIGHT),
+                ("colleges_total", "queued", FG_DIM),
+                ("links", "links", ACCENT_CYAN),
                 ("candidates", "candidates", ACCENT_PURPLE),
-                ("pages", "pages fetched", ACCENT_CYAN),
-                ("scholarships", "scholarships found", GREEN),
-                ("groq_calls", "groq calls", ACCENT_AMBER),
+                ("pages", "pages", ACCENT_CYAN),
+                ("scholarships", "scholarships", GREEN),
+                ("groq_calls", "calls", ACCENT_AMBER),
             ]
             for key, label, color in specs:
                 cell = tk.Frame(bar, bg=BG_PANEL)
-                cell.pack(side="left", padx=(0, 22))
+                cell.pack(side="left", padx=(0, 10))
                 v = tk.StringVar(value="0")
-                tk.Label(cell, textvariable=v, bg=BG_PANEL, fg=color, font=("TkDefaultFont", 15, "bold")).pack(anchor="w")
-                tk.Label(cell, text=label, bg=BG_PANEL, fg=FG_DIM, font=("TkDefaultFont", 8)).pack(anchor="w")
+                tk.Label(cell, textvariable=v, bg=BG_PANEL, fg=color, font=("TkDefaultFont", 10, "bold")).pack(side="left")
+                tk.Label(cell, text=f" {label}", bg=BG_PANEL, fg=FG_DIM, font=("TkDefaultFont", 8)).pack(side="left")
                 self.stat_vars[key] = v
+            _sep(bar)
             self.elapsed_var = tk.StringVar(value="0m00s")
             cell = tk.Frame(bar, bg=BG_PANEL)
-            cell.pack(side="right")
-            tk.Label(cell, textvariable=self.elapsed_var, bg=BG_PANEL, fg=FG_BRIGHT, font=("TkDefaultFont", 15, "bold")).pack(anchor="w")
-            tk.Label(cell, text="elapsed", bg=BG_PANEL, fg=FG_DIM, font=("TkDefaultFont", 8)).pack(anchor="w")
+            cell.pack(side="left")
+            tk.Label(cell, textvariable=self.elapsed_var, bg=BG_PANEL, fg=FG_BRIGHT, font=("TkDefaultFont", 10, "bold")).pack(side="left")
+            tk.Label(cell, text=" elapsed", bg=BG_PANEL, fg=FG_DIM, font=("TkDefaultFont", 8)).pack(side="left")
             self._refresh_stats_labels()
+
+        # ---- Pane: Provider status + live error log ----
+
+        def _build_provider_log_pane(self, parent):
+            frame = tk.LabelFrame(parent, text="Live Log (providers, retries, HTTP errors)",
+                                   bg=BG_PANEL, fg=ACCENT_AMBER, padx=8, pady=8)
+            frame.pack(fill="both", expand=True, padx=6, pady=(0, 4))
+            scroll = ttk.Scrollbar(frame)
+            scroll.pack(side="right", fill="y")
+            self.provider_log_text = tk.Text(frame, state="disabled", yscrollcommand=scroll.set,
+                                              bg=BG_DARK, fg=FG_DIM, bd=0, highlightthickness=0,
+                                              font=("Consolas", 8), wrap="word")
+            self.provider_log_text.pack(fill="both", expand=True)
+            scroll.config(command=self.provider_log_text.yview)
+            self.provider_log_text.tag_configure("err", foreground=RED)
+            self.provider_log_text.tag_configure("warn", foreground=ACCENT_AMBER)
+            self.provider_log_text.tag_configure("info", foreground=FG_DIM)
+
+        def _provider_log(self, text):
+            """Every message call_groq()/_call_llm_once() would otherwise
+            have printed to a console (provider/model tried, retries,
+            timeouts, 401/403/429s, fallbacks) now lands here live instead
+            of being silently dropped -- this is the fix for calls that
+            were failing quietly. Also updates the "Using:" indicator by
+            picking the provider/model out of the "using X/Y" or "fell
+            back to X/Y" lines call_groq() logs on every successful call."""
+            low = text.lower()
+            if "!" in text or any(code in text for code in (" 401", " 403", " 429")) or \
+               "timeout" in low or "failed" in low or "error" in low:
+                tag = "err"
+            elif "fell back" in low or "escalating" in low or "tapped out" in low:
+                tag = "warn"
+            else:
+                tag = "info"
+            self.provider_log_text.configure(state="normal")
+            self.provider_log_text.insert("end", text.rstrip() + "\n", tag)
+            line_count = int(self.provider_log_text.index("end-1c").split(".")[0])
+            if line_count > MAX_LOG_LINES:
+                self.provider_log_text.delete("1.0", f"{line_count - MAX_LOG_LINES}.0")
+            self.provider_log_text.see("end")
+            self.provider_log_text.configure(state="disabled")
+
+            m = re.search(r"(?:using|fell back to) ([\w.\-]+)/([\w.\-:]+)", text)
+            if m:
+                self.provider_status_var.set(f"{m.group(1)} / {m.group(2)}")
+
+
 
         # ---- Pane 1: Crawled Site ----
 
@@ -2098,17 +2478,9 @@ def _run_gui():
             frame = tk.LabelFrame(parent, text="Groq's Response", bg=BG_PANEL, fg=GREEN, padx=8, pady=8)
             frame.pack(fill="both", expand=True, padx=6, pady=(4, 0))
 
-            groq_split = tk.PanedWindow(frame, orient="vertical", sashwidth=6, bg=BG_PANEL, sashrelief="flat", bd=0)
-            groq_split.pack(fill="both", expand=True)
-
-            log_frame = tk.Frame(groq_split, bg=BG_PANEL)
-            results_frame = tk.Frame(groq_split, bg=BG_PANEL)
-            groq_split.add(log_frame, stretch="always")
-            groq_split.add(results_frame, stretch="always")
-
-            log_scroll = ttk.Scrollbar(log_frame)
+            log_scroll = ttk.Scrollbar(frame)
             log_scroll.pack(side="right", fill="y")
-            self.groq_log_text = tk.Text(log_frame, state="disabled", yscrollcommand=log_scroll.set,
+            self.groq_log_text = tk.Text(frame, state="disabled", yscrollcommand=log_scroll.set,
                                           bg=BG_DARK, fg=FG_BRIGHT, bd=0, highlightthickness=0,
                                           font=("Consolas", 8), wrap="word")
             self.groq_log_text.pack(fill="both", expand=True)
@@ -2118,42 +2490,6 @@ def _run_gui():
             self.groq_log_text.tag_configure("warn", foreground=ACCENT_AMBER)
             self.groq_log_text.tag_configure("err", foreground=RED)
             self.groq_log_text.tag_configure("pass1", foreground=ACCENT_PURPLE)
-
-            tk.Label(results_frame, text="Pass 2 — rough program summaries found so far "
-                                          "(pass 1's raw snippets stream in the log above):",
-                     bg=BG_PANEL, fg=FG_DIM, font=("TkDefaultFont", 8, "bold")).pack(anchor="w", pady=(0, 4))
-
-            cards_outer = tk.Frame(results_frame, bg=BG_PANEL)
-            cards_outer.pack(fill="both", expand=True)
-            self.cards_canvas = tk.Canvas(cards_outer, bg=BG_PANEL, bd=0, highlightthickness=0)
-            cscroll = ttk.Scrollbar(cards_outer, orient="vertical", command=self.cards_canvas.yview)
-            self.cards_canvas.configure(yscrollcommand=cscroll.set)
-            self.cards_canvas.pack(side="left", fill="both", expand=True)
-            cscroll.pack(side="right", fill="y")
-
-            self.cards_container = tk.Frame(self.cards_canvas, bg=BG_PANEL)
-            self._cards_window = self.cards_canvas.create_window((0, 0), window=self.cards_container, anchor="nw")
-
-            def _sync_scrollregion(_event=None):
-                self.cards_canvas.configure(scrollregion=self.cards_canvas.bbox("all"))
-
-            def _sync_card_width(event):
-                self.cards_canvas.itemconfigure(self._cards_window, width=event.width)
-
-            self.cards_container.bind("<Configure>", _sync_scrollregion)
-            self.cards_canvas.bind("<Configure>", _sync_card_width)
-
-            def _on_mousewheel(event):
-                delta = -1 if event.delta > 0 else 1
-                if event.num == 5:
-                    delta = 1
-                elif event.num == 4:
-                    delta = -1
-                self.cards_canvas.yview_scroll(delta, "units")
-
-            self.cards_canvas.bind_all("<MouseWheel>", _on_mousewheel)   # Windows/macOS
-            self.cards_canvas.bind_all("<Button-4>", _on_mousewheel)     # Linux scroll up
-            self.cards_canvas.bind_all("<Button-5>", _on_mousewheel)     # Linux scroll down
 
             self._card_count = 0
 
@@ -2170,31 +2506,12 @@ def _run_gui():
             return FG_DIM
 
         def _add_scholarship_card(self, college, type_str, summary, enriched=False):
-            badge_color = self._color_for_type(type_str)
-            border_color = GREEN if enriched else BORDER
-            card = tk.Frame(self.cards_container, bg=BG_PANEL2, highlightthickness=2 if enriched else 1,
-                             highlightbackground=border_color, padx=8, pady=6)
-            card.pack(fill="x", padx=2, pady=3)
-
-            top_row = tk.Frame(card, bg=BG_PANEL2)
-            top_row.pack(fill="x")
-            name_text = college + ("  ✓ FAQ-enriched" if enriched else "")
-            tk.Label(top_row, text=name_text, bg=BG_PANEL2, fg=(GREEN if enriched else FG_BRIGHT),
-                     font=("TkDefaultFont", 9, "bold")).pack(side="left")
-            tk.Label(top_row, text=(type_str or "unclassified"), bg=BG_PANEL2, fg=badge_color,
-                     font=("TkDefaultFont", 8, "bold")).pack(side="right")
-
-            tk.Label(card, text=summary or "(no summary text)", bg=BG_PANEL2, fg=FG_DIM,
-                     wraplength=440, justify="left", font=("TkDefaultFont", 9)).pack(
-                fill="x", anchor="w", pady=(3, 0))
-
+            # The "Pass 2 rough summaries" card box was removed from the
+            # layout -- this entry's already visible in the Groq log above
+            # (and in "Preview Data"), so this just keeps a running count.
             self._card_count += 1
-            self.cards_canvas.after_idle(
-                lambda: self.cards_canvas.configure(scrollregion=self.cards_canvas.bbox("all")))
 
         def _clear_cards(self):
-            for child in self.cards_container.winfo_children():
-                child.destroy()
             self._card_count = 0
 
         # ---------------- helpers ----------------
@@ -2231,10 +2548,6 @@ def _run_gui():
             except OSError as exc:
                 messagebox.showerror("Load failed", str(exc))
 
-        def _on_reset_sample(self):
-            self._domains_text.delete("1.0", "end")
-            self._domains_text.insert("1.0", "\n".join(DEFAULT_SAMPLE_COLLEGES))
-
         def _parse_domains(self):
             raw = self._domains_text.get("1.0", "end")
             domains = [ln.strip() for ln in raw.splitlines() if ln.strip() and not ln.strip().startswith("#")]
@@ -2243,19 +2556,52 @@ def _run_gui():
 
         def _on_check_key_clicked(self):
             _refresh_groq_env()
-            any_key = any(os.environ.get(p["api_key_env"], "").strip() for p in LLM_PROVIDERS)
-            title = "Provider key(s) found" if any_key else "No provider API keys found"
-            if any_key:
+            ready = bool(_configured_providers())
+            title = "LLM provider ready" if ready else "No LLM provider configured"
+            if ready:
                 messagebox.showinfo(title, llm_provider_diagnostic())
             else:
                 messagebox.showerror(title, llm_provider_diagnostic())
+
+        def _on_preview_data(self):
+            """Small popup window showing all the raw pipeline output
+            collected so far (same text that's streamed into the Groq log
+            pane), as a snapshot with a manual refresh button."""
+            win = tk.Toplevel(self)
+            win.title("Preview — Raw Output Data")
+            win.configure(bg=BG_DARK)
+            win.geometry("560x420")
+
+            top = tk.Frame(win, bg=BG_DARK)
+            top.pack(fill="x", padx=8, pady=(8, 4))
+            tk.Label(top, text="All raw output collected so far", bg=BG_DARK, fg=FG_DIM,
+                     font=("TkDefaultFont", 9, "bold")).pack(side="left")
+
+            body = tk.Frame(win, bg=BG_DARK)
+            body.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+            scroll = ttk.Scrollbar(body)
+            scroll.pack(side="right", fill="y")
+            preview_text = tk.Text(body, yscrollcommand=scroll.set, bg=BG_PANEL2, fg=FG_BRIGHT,
+                                    bd=0, highlightthickness=0, font=("Consolas", 8), wrap="word")
+            preview_text.pack(fill="both", expand=True)
+            scroll.config(command=preview_text.yview)
+
+            def _refresh():
+                data = self.groq_log_text.get("1.0", "end-1c")
+                preview_text.configure(state="normal")
+                preview_text.delete("1.0", "end")
+                preview_text.insert("1.0", data if data.strip() else "(nothing collected yet)")
+                preview_text.configure(state="disabled")
+
+            ttk.Button(top, text="Refresh", command=_refresh).pack(side="right")
+            _refresh()
 
         def _on_start_clicked(self):
             if self._running:
                 return
             _refresh_groq_env()  # picks up a .env edited or a var exported after this GUI launched
             reset_provider_fallback_state()  # give every provider a clean shot for this new run
-            if not _configured_providers():
+            if not MANUAL_PASTE_MODE and not _configured_providers():
                 messagebox.showerror("No LLM provider API keys set", llm_provider_diagnostic())
                 return
             domains = self._parse_domains()
@@ -2263,6 +2609,7 @@ def _run_gui():
                 messagebox.showwarning("No colleges", "Add at least one college domain first.")
                 return
 
+            self._reset_stage_bar()
             self._running = True
             self._start_time = time.time()
             self._stats = dict(colleges_done=0, colleges_total=len(domains), links=0, candidates=0,
@@ -2281,6 +2628,10 @@ def _run_gui():
             self.page_text_widget.configure(state="normal")
             self.page_text_widget.delete("1.0", "end")
             self.page_text_widget.configure(state="disabled")
+            self.provider_status_var.set("—")
+            self.provider_log_text.configure(state="normal")
+            self.provider_log_text.delete("1.0", "end")
+            self.provider_log_text.configure(state="disabled")
 
             self.start_btn.configure(state="disabled")
             self.stop_btn.configure(state="normal")
@@ -2330,11 +2681,16 @@ def _run_gui():
                 self._stats["colleges_total"] = kw.get("total", 0)
                 self._refresh_stats_labels()
 
+            elif event == "log_line":
+                self._provider_log(kw.get("text", ""))
+
             elif event == "college_start":
+                self._advance_stage("crawl")
                 self._current_domain = domain
                 idx, total = kw.get("index"), kw.get("total")
                 progress = f" ({idx + 1}/{total})" if idx is not None and total else ""
                 self.pipe_status.configure(text=f"Crawling {domain}{progress}")
+                self._append_stage_text("crawl", f"[{ts}] === {domain} ===\nhomepage: {kw.get('homepage', '')}")
                 self.site_status_var.set(f"{domain} -> {kw.get('homepage', '')}")
                 self.site_links_text.configure(state="normal")
                 self.site_links_text.delete("1.0", "end")
@@ -2348,6 +2704,10 @@ def _run_gui():
                 links = kw.get("links", [])
                 self._stats["links"] += len(links)
                 self._refresh_stats_labels()
+                self._stage_counts["crawl"] += len(links)
+                self._set_stage_result("crawl", f"{self._stage_counts['crawl']} link(s) found")
+                link_lines = "\n".join(f"{(l.get('text') or '(no text)')[:50]:<50}  {l['url']}" for l in links)
+                self._append_stage_text("crawl", f"[{ts}] {len(links)} link(s) found:\n{link_lines}")
                 self.site_status_var.set(f"{self._current_domain} -> {kw.get('homepage', '')}  "
                                           f"({len(links)} link(s) found)")
                 self.site_links_text.configure(state="normal")
@@ -2358,13 +2718,17 @@ def _run_gui():
                 self.site_links_text.configure(state="disabled")
 
             elif event == "link_triage_request":
+                self._advance_stage("triage")
                 self._stats["groq_calls"] += 1
                 self._refresh_stats_labels()
+                self._append_stage_text("triage", f"[{ts}] -> asking Groq to triage "
+                                                    f"{kw.get('link_count', 0)} link(s) on {kw.get('homepage', '')}")
                 self._groq_log(f"[{ts}] -> asking Groq to triage {kw.get('link_count', 0)} link(s) "
                                 f"on {kw.get('homepage', '')}", "hdr")
 
             elif event == "link_triage_response":
                 candidates = kw.get("candidates", [])
+                self._append_stage_text("triage", f"[{ts}] <- raw reply:\n{(kw.get('raw') or '')[:2000]}")
                 self._groq_log(f"[{ts}] <- Groq link-triage raw reply:", "hdr")
                 self._groq_log((kw.get("raw") or "")[:2000], "raw")
 
@@ -2372,6 +2736,10 @@ def _run_gui():
                 candidates = kw.get("candidates", [])
                 self._stats["candidates"] += len(candidates)
                 self._refresh_stats_labels()
+                self._stage_counts["triage"] += len(candidates)
+                self._set_stage_result("triage", f"{self._stage_counts['triage']} candidate page(s) selected")
+                cand_lines = "\n".join(f"• {c.get('url','')} (conf: {c.get('confidence','?')})" for c in candidates)
+                self._append_stage_text("triage", f"[{ts}] {len(candidates)} candidate(s) selected:\n{cand_lines}")
                 for c in candidates:
                     u = c.get("url", "")
                     if u in self._links_tree_rows:
@@ -2386,14 +2754,18 @@ def _run_gui():
                                 f"({c.get('reason', '')})", "warn")
 
             elif event == "page_start":
+                self._advance_stage("fetch")
                 item_id = self._links_tree_rows.get(url)
                 if item_id:
                     self.links_tree.set(item_id, "status", "fetching…")
                 self.pipe_status.configure(text=f"Fetching {url}")
+                self._append_stage_text("fetch", f"[{ts}] fetching {url}")
 
             elif event == "page_fetched":
                 self._stats["pages"] += 1
                 self._refresh_stats_labels()
+                self._stage_counts["fetch"] += 1
+                self._set_stage_result("fetch", f"{self._stage_counts['fetch']} page(s) fetched")
 
             elif event == "page_text_extracted":
                 text = kw.get("text", "")
@@ -2405,19 +2777,28 @@ def _run_gui():
                 self.page_text_widget.delete("1.0", "end")
                 self.page_text_widget.insert("1.0", preview + truncated_note)
                 self.page_text_widget.configure(state="disabled")
+                stage_preview = text[:3000] + ("…" if len(text) > 3000 else "")
+                self._append_stage_text("fetch", f"[{ts}] extracted {len(text)} char(s) from {url}:\n{stage_preview}")
 
             elif event == "pass1_chunk_split":
                 self._groq_log(f"[{ts}]    [pass 1] {url} split into {kw.get('chunk_count')} chunk(s) "
                                 f"(ladder step: {kw.get('split_n')})", "warn")
 
             elif event == "pass1_chunk_request":
+                self._advance_stage("pass1")
                 self._stats["groq_calls"] += 1
                 self._refresh_stats_labels()
+                self._append_stage_text("pass1", f"[{ts}] -> chunk {kw.get('chunk_index', 0) + 1}/"
+                                                   f"{kw.get('total_chunks', 1)} :: {url}")
                 self._groq_log(f"[{ts}] -> [PASS 1 / loose sweep] chunk {kw.get('chunk_index', 0) + 1}/"
                                 f"{kw.get('total_chunks', 1)} :: {url}", "hdr")
 
             elif event == "pass1_chunk_response":
                 snippets = kw.get("snippets", [])
+                self._stage_counts["pass1"] += len(snippets)
+                self._set_stage_result("pass1", f"{self._stage_counts['pass1']} raw snippet(s) flagged")
+                self._append_stage_text("pass1", f"[{ts}] <- {len(snippets)} snippet(s):\n"
+                                                   f"{(kw.get('raw') or '')[:1200]}")
                 self._groq_log(f"[{ts}] <- [PASS 1] found {len(snippets)} possible "
                                 f"snippet(s) in this chunk:", "hdr")
                 for s in snippets:
@@ -2429,14 +2810,23 @@ def _run_gui():
                 self._groq_log((kw.get("raw") or "")[:1200], "raw")
 
             elif event == "pass2_request":
+                self._advance_stage("pass2")
                 self._stats["groq_calls"] += 1
                 self._refresh_stats_labels()
+                self._append_stage_text("pass2", f"[{ts}] -> batch {kw.get('batch_index', 0) + 1}/"
+                                                   f"{kw.get('total_batches', 1)} :: "
+                                                   f"{kw.get('snippet_count', 0)} snippet(s) :: {url}")
                 self._groq_log(f"[{ts}] -> [PASS 2 / structuring] batch {kw.get('batch_index', 0) + 1}/"
                                 f"{kw.get('total_batches', 1)} :: {kw.get('snippet_count', 0)} snippet(s) :: {url}",
                                 "hdr")
 
             elif event == "pass2_response":
                 entries = kw.get("entries", [])
+                self._stage_counts["pass2"] += len(entries)
+                self._set_stage_result("pass2", f"{self._stage_counts['pass2']} entries drafted")
+                self._append_stage_text("pass2", f"[{ts}] <- {len(entries)} entr"
+                                                   f"{'y' if len(entries) == 1 else 'ies'}:\n"
+                                                   f"{(kw.get('raw') or '')[:2000]}")
                 self._groq_log(f"[{ts}] <- [PASS 2] wrote up "
                                 f"{len(entries)} program summar{'y' if len(entries) == 1 else 'ies'}:", "hdr")
                 self._groq_log((kw.get("raw") or "")[:2000], "raw")
@@ -2465,26 +2855,37 @@ def _run_gui():
                     self.links_tree.set(item_id, "found", f"{len(entries)} ({len(snippets)} raw)")
 
             elif event == "faq_fetch_start":
+                self._advance_stage("pass3")
                 self.pipe_status.configure(text=f"Fetching FAQ page {url}")
+                self._append_stage_text("pass3", f"[{ts}] -> fetching FAQ page {url}")
                 self._groq_log(f"[{ts}] -> [PASS 3 / FAQ gap-fill] fetching {url}", "hdr")
 
             elif event == "faq_fetched":
+                self._append_stage_text("pass3", f"[{ts}] FAQ page extracted "
+                                                   f"({kw.get('text_len', 0)} char(s)): {url}")
                 self._groq_log(f"[{ts}]    FAQ page extracted ({kw.get('text_len', 0)} chars): {url}", "warn")
 
             elif event == "gap_fill_request":
                 self._stats["groq_calls"] += 1
                 self._refresh_stats_labels()
+                self._append_stage_text("pass3", f"[{ts}] -> chunk {kw.get('chunk_index', 0) + 1}/"
+                                                   f"{kw.get('total_chunks', 1)} :: {url}")
                 self._groq_log(f"[{ts}] -> [PASS 3 / FAQ gap-fill] chunk {kw.get('chunk_index', 0) + 1}/"
                                 f"{kw.get('total_chunks', 1)} :: {url}", "hdr")
 
             elif event == "gap_fill_response":
                 entries = kw.get("entries", [])
+                self._append_stage_text("pass3", f"[{ts}] <- {len(entries)} entr"
+                                                   f"{'y' if len(entries) == 1 else 'ies'} so far:\n"
+                                                   f"{(kw.get('raw') or '')[:1500]}")
                 self._groq_log(f"[{ts}] <- [PASS 3] running total after this FAQ chunk: "
                                 f"{len(entries)} entr{'y' if len(entries) == 1 else 'ies'}", "hdr")
                 self._groq_log((kw.get("raw") or "")[:1500], "raw")
 
             elif event == "gap_fill_done":
                 entries = kw.get("entries", [])
+                self._stage_counts["pass3"] += len(entries)
+                self._set_stage_result("pass3", f"{self._stage_counts['pass3']} enriched via FAQ")
                 self._groq_log(f"[{ts}] === [PASS 3] FAQ gap-fill done for {domain} — "
                                 f"{len(entries)} enriched entr{'y' if len(entries) == 1 else 'ies'} ===", "hdr")
                 for e in entries:
@@ -2493,13 +2894,26 @@ def _run_gui():
                     self._add_scholarship_card(domain, e.get("type", ""), e.get("summary", ""), enriched=True)
 
             elif event == "pass4_start":
+                self._advance_stage("pass4")
                 self.pipe_status.configure(text=f"Regex cross-check (pass 4, no Groq) for {domain}")
+                self._append_stage_text("pass4", f"[{ts}] -> scanning raw page text for {domain}")
                 self._groq_log(f"[{ts}] -> [PASS 4 / regex cross-check, no Groq call] scanning "
                                 f"raw page text for {domain}", "hdr")
 
             elif event == "pass4_done":
                 paragraphs = kw.get("paragraphs", [])
                 flagged = kw.get("flagged", [])
+                self._stage_counts["pass4"] += len(paragraphs)
+                self._pass4_flagged_count += len(flagged)
+                self._set_stage_result("pass4", f"{self._stage_counts['pass4']} matched · "
+                                                 f"{self._pass4_flagged_count} flagged new")
+                stage_lines = [f"[{ts}] {len(paragraphs)} matched, {len(flagged)} flagged new:"]
+                for item in paragraphs:
+                    flag_note = "  [NEW]" if item in flagged else ""
+                    kws = ", ".join(item.get("matched_keywords", []))
+                    snippet = item.get("paragraph", "").replace("\n", " ")[:300]
+                    stage_lines.append(f"• ({kws}) [{item.get('source', '')}]{flag_note}\n    {snippet}")
+                self._append_stage_text("pass4", "\n".join(stage_lines))
                 self._groq_log(f"[{ts}] === [PASS 4] {domain} -- {len(paragraphs)} keyword-matched "
                                 f"paragraph(s) found, {len(flagged)} flagged as possibly not reflected "
                                 f"in pass 3's output ===", "hdr")
@@ -2518,6 +2932,7 @@ def _run_gui():
                     self._groq_log(f"[{ts}] ! {domain} failed: {kw.get('error')}", "err")
 
             elif event == "run_done":
+                self._reset_stage_bar()
                 self._running = False
                 self.start_btn.configure(state="normal")
                 self.stop_btn.configure(state="disabled")
@@ -2570,13 +2985,15 @@ def main():
 
     def log(msg):
         if not args.quiet:
-            print(msg)
+            print(msg, flush=True)
 
     reset_provider_fallback_state()  # clean slate for this run
-    if not _configured_providers():
+    if not MANUAL_PASTE_MODE and not _configured_providers():
         print("! No LLM provider API keys are set. Exiting.\n", file=sys.stderr)
         print(llm_provider_diagnostic(), file=sys.stderr)
         sys.exit(1)
+
+    warm_up_model(model=args.model, log=log)
 
     all_results = []
     for domain in domains:

@@ -1,0 +1,422 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>offr — live</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#050505;
+    --panel:#0d0d0d;
+    --panel-2:#111214;
+    --line:#232427;
+    --line-soft:#191a1c;
+    --fg:#f2f2f0;
+    --fg-dim:#8a8b8d;
+    --fg-faint:#4a4b4d;
+    --track:#1c1d1f;
+    --fill:#f2f2f0;
+    --mono:'JetBrains Mono', ui-monospace, monospace;
+    --sans:'Inter', -apple-system, sans-serif;
+  }
+  *{box-sizing:border-box; margin:0; padding:0;}
+  html,body{background:var(--bg); color:var(--fg);}
+  body{
+    font-family:var(--sans);
+    min-height:100vh;
+    padding:28px clamp(16px,3vw,40px) 60px;
+    -webkit-font-smoothing:antialiased;
+  }
+  ::selection{background:var(--fg); color:var(--bg);}
+
+  /* ---------- header ---------- */
+  header{
+    display:flex; align-items:flex-end; justify-content:space-between;
+    border-bottom:1px solid var(--line);
+    padding-bottom:18px; margin-bottom:22px; flex-wrap:wrap; gap:14px;
+  }
+  .brand{display:flex; align-items:baseline; gap:14px;}
+  .brand h1{
+    font-family:var(--mono); font-weight:700; font-size:22px; letter-spacing:2px;
+    text-transform:uppercase;
+  }
+  .brand .sub{color:var(--fg-dim); font-size:12px; letter-spacing:1px; text-transform:uppercase;}
+  .status{
+    display:flex; align-items:center; gap:20px; font-family:var(--mono); font-size:12px; color:var(--fg-dim);
+  }
+  .dot{width:7px; height:7px; border-radius:50%; background:var(--fg); display:inline-block; margin-right:7px;}
+  .dot.pulse{animation:pulse 1.6s ease-in-out infinite;}
+  .dot.dead{background:var(--fg-faint); animation:none;}
+  @keyframes pulse{0%,100%{opacity:1;} 50%{opacity:.25;}}
+  .clock{color:var(--fg); font-variant-numeric:tabular-nums;}
+
+  /* ---------- scope strip ---------- */
+  .scope{
+    border:1px solid var(--line); background:var(--panel);
+    padding:16px 18px 12px; margin-bottom:22px; position:relative;
+  }
+  .scope-head{
+    display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;
+  }
+  .eyebrow{
+    font-family:var(--mono); font-size:10px; letter-spacing:2.5px; text-transform:uppercase; color:var(--fg-faint);
+  }
+  .legend{display:flex; gap:18px; font-family:var(--mono); font-size:11px; color:var(--fg-dim);}
+  .legend span{display:flex; align-items:center; gap:6px;}
+  .legend i{width:14px; height:0; border-top:2px solid var(--fg); display:inline-block;}
+  .legend i.dashed{border-top-style:dashed;}
+  .legend i.dotted{border-top-style:dotted; border-top-width:2.5px;}
+  canvas#scope{width:100%; height:120px; display:block;}
+
+  /* ---------- grid ---------- */
+  .grid{
+    display:grid; grid-template-columns:repeat(auto-fit, minmax(280px,1fr)); gap:16px;
+  }
+  .card{
+    border:1px solid var(--line); background:var(--panel); padding:18px 18px 16px;
+    display:flex; flex-direction:column; gap:12px; min-width:0;
+  }
+  .card-head{display:flex; justify-content:space-between; align-items:baseline; gap:8px;}
+  .card-head .eyebrow{color:var(--fg-dim);}
+  .card-head .tag{font-family:var(--mono); font-size:10px; color:var(--fg-faint); letter-spacing:1px;}
+
+  .bignum{font-family:var(--mono); font-size:38px; font-weight:700; line-height:1; letter-spacing:-0.5px;}
+  .bignum .unit{font-size:15px; font-weight:400; color:var(--fg-dim); margin-left:4px;}
+  .caption{font-size:12px; color:var(--fg-dim);}
+
+  .bar{height:6px; background:var(--track); position:relative; overflow:hidden;}
+  .bar > i{position:absolute; inset:0 auto 0 0; background:var(--fill); width:0%; transition:width .5s ease;}
+  .bar.thin{height:4px;}
+
+  .rows{display:flex; flex-direction:column; gap:8px;}
+  .row{display:flex; align-items:center; gap:10px;}
+  .row .lbl{
+    font-family:var(--mono); font-size:11px; color:var(--fg-dim); width:64px; flex:none;
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+  }
+  .row .bar{flex:1;}
+  .row .val{
+    font-family:var(--mono); font-size:11px; color:var(--fg); width:52px; text-align:right; flex:none;
+  }
+
+  .kv{display:flex; justify-content:space-between; font-family:var(--mono); font-size:12px; padding:5px 0; border-top:1px solid var(--line-soft);}
+  .kv:first-of-type{border-top:none;}
+  .kv .k{color:var(--fg-dim);}
+  .kv .v{color:var(--fg); text-align:right;}
+
+  .cores{display:grid; grid-template-columns:repeat(auto-fill,minmax(10px,1fr)); gap:3px; align-items:end; height:34px;}
+  .cores i{background:var(--track); position:relative; height:100%; display:block;}
+  .cores i b{position:absolute; bottom:0; left:0; right:0; background:var(--fill); height:0%; transition:height .5s ease;}
+
+  .pill{
+    font-family:var(--mono); font-size:10px; letter-spacing:1px; text-transform:uppercase;
+    border:1px solid var(--line); padding:3px 8px; color:var(--fg-dim); display:inline-flex; align-items:center; gap:6px;
+  }
+  .pill .dot{margin:0;}
+  .pill.on{color:var(--fg); border-color:#3a3b3e;}
+
+  .model-list{display:flex; flex-direction:column; gap:0;}
+  .model{
+    display:flex; justify-content:space-between; align-items:center; gap:10px;
+    padding:8px 0; border-top:1px solid var(--line-soft); font-family:var(--mono); font-size:11.5px;
+  }
+  .model:first-child{border-top:none;}
+  .model .mname{color:var(--fg); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
+  .model .mmeta{color:var(--fg-faint); flex:none;}
+  .model.running .mname::before{content:"▸ "; color:var(--fg);}
+  .empty{font-family:var(--mono); font-size:12px; color:var(--fg-faint); padding:10px 0;}
+
+  .span2{grid-column:span 2;}
+  @media (max-width:640px){.span2{grid-column:span 1;}}
+
+  footer{
+    margin-top:30px; text-align:center; font-family:var(--mono); font-size:10px;
+    letter-spacing:1.5px; text-transform:uppercase; color:var(--fg-faint);
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="brand">
+    <h1 id="hostname">offr</h1>
+    <div class="sub" id="uptime">uptime —</div>
+  </div>
+  <div class="status">
+    <span><i class="dot pulse" id="live-dot"></i><span id="live-label">connecting</span></span>
+    <span class="clock" id="clock">--:--:--</span>
+  </div>
+</header>
+
+<div class="scope">
+  <div class="scope-head">
+    <div class="eyebrow">Live trace · last 60 samples</div>
+    <div class="legend">
+      <span><i></i>CPU</span>
+      <span><i class="dashed"></i>GPU</span>
+      <span><i class="dotted"></i>RAM</span>
+    </div>
+  </div>
+  <canvas id="scope"></canvas>
+</div>
+
+<div class="grid">
+
+  <!-- CPU -->
+  <div class="card">
+    <div class="card-head"><div class="eyebrow">CPU</div><div class="tag" id="cpu-count">— cores</div></div>
+    <div class="bignum" id="cpu-pct">—<span class="unit">%</span></div>
+    <div class="bar"><i id="cpu-bar"></i></div>
+    <div class="cores" id="cpu-cores"></div>
+    <div class="caption" id="cpu-load">load avg —</div>
+  </div>
+
+  <!-- MEMORY -->
+  <div class="card">
+    <div class="card-head"><div class="eyebrow">Memory</div><div class="tag" id="mem-total">— GB</div></div>
+    <div class="bignum" id="mem-pct">—<span class="unit">%</span></div>
+    <div class="bar"><i id="mem-bar"></i></div>
+    <div class="caption" id="mem-used">— / — GB</div>
+    <div class="kv"><span class="k">Swap</span><span class="v" id="swap-val">—</span></div>
+  </div>
+
+  <!-- GPU -->
+  <div class="card">
+    <div class="card-head"><div class="eyebrow">GPU</div><div class="tag" id="gpu-name">—</div></div>
+    <div class="bignum" id="gpu-pct">—<span class="unit">%</span></div>
+    <div class="bar"><i id="gpu-bar"></i></div>
+    <div class="kv"><span class="k">VRAM</span><span class="v" id="gpu-vram">—</span></div>
+    <div class="kv"><span class="k">Temp</span><span class="v" id="gpu-temp">—</span></div>
+    <div class="kv"><span class="k">Power</span><span class="v" id="gpu-power">—</span></div>
+    <div class="kv"><span class="k">Fan</span><span class="v" id="gpu-fan">—</span></div>
+  </div>
+
+  <!-- OLLAMA -->
+  <div class="card span2">
+    <div class="card-head">
+      <div class="eyebrow">Ollama</div>
+      <span class="pill" id="ollama-pill"><i class="dot dead"></i><span id="ollama-pill-label">offline</span></span>
+    </div>
+    <div class="model-list" id="ollama-models"><div class="empty">no data yet</div></div>
+  </div>
+
+  <!-- PLEX -->
+  <div class="card">
+    <div class="card-head">
+      <div class="eyebrow">Plex</div>
+      <span class="pill" id="plex-pill"><i class="dot dead"></i><span id="plex-pill-label">offline</span></span>
+    </div>
+    <div class="kv"><span class="k">Version</span><span class="v" id="plex-version">—</span></div>
+    <div class="kv"><span class="k">Streams</span><span class="v" id="plex-streams">—</span></div>
+  </div>
+
+  <!-- NETWORK -->
+  <div class="card">
+    <div class="card-head"><div class="eyebrow">Network</div><div class="tag">rate</div></div>
+    <div class="kv"><span class="k">↑ Up</span><span class="v" id="net-up">—</span></div>
+    <div class="kv"><span class="k">↓ Down</span><span class="v" id="net-down">—</span></div>
+    <div class="kv"><span class="k">Sent</span><span class="v" id="net-sent">—</span></div>
+    <div class="kv"><span class="k">Recv</span><span class="v" id="net-recv">—</span></div>
+  </div>
+
+  <!-- DISK -->
+  <div class="card span2">
+    <div class="card-head"><div class="eyebrow">Disks</div><div class="tag" id="disk-count">—</div></div>
+    <div class="rows" id="disk-rows"></div>
+  </div>
+
+</div>
+
+<footer>offr dashboard · polling every 2s</footer>
+
+<script>
+const POLL_MS = 2000;
+const HISTORY_LEN = 60;
+const history = { cpu: [], gpu: [], ram: [] };
+
+function fmtBytesRate(bps){
+  if(bps < 1024) return bps.toFixed(0)+' B/s';
+  if(bps < 1024*1024) return (bps/1024).toFixed(1)+' KB/s';
+  return (bps/1024/1024).toFixed(2)+' MB/s';
+}
+function fmtUptime(s){
+  s = Math.floor(s);
+  const d = Math.floor(s/86400); s -= d*86400;
+  const h = Math.floor(s/3600); s -= h*3600;
+  const m = Math.floor(s/60);
+  let parts = [];
+  if(d) parts.push(d+'d');
+  parts.push(String(h).padStart(2,'0')+'h');
+  parts.push(String(m).padStart(2,'0')+'m');
+  return 'uptime ' + parts.join(' ');
+}
+function setBar(el, pct){ el.style.width = Math.max(0, Math.min(100, pct||0)) + '%'; }
+function setPill(pillEl, dotEl, labelEl, on, label){
+  dotEl.classList.toggle('dead', !on);
+  dotEl.classList.toggle('pulse', on);
+  pillEl.classList.toggle('on', on);
+  labelEl.textContent = label;
+}
+
+// ---- scope canvas ----
+const canvas = document.getElementById('scope');
+const ctx = canvas.getContext('2d');
+function resizeCanvas(){
+  const rect = canvas.getBoundingClientRect();
+  canvas.width = rect.width * devicePixelRatio;
+  canvas.height = rect.height * devicePixelRatio;
+}
+window.addEventListener('resize', () => { resizeCanvas(); drawScope(); });
+
+function drawScope(){
+  const w = canvas.width, h = canvas.height;
+  ctx.clearRect(0,0,w,h);
+  // grid
+  ctx.strokeStyle = 'rgba(255,255,255,0.05)';
+  ctx.lineWidth = 1;
+  for(let i=1;i<4;i++){
+    const y = (h/4)*i;
+    ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(w,y); ctx.stroke();
+  }
+  const drawLine = (arr, dash) => {
+    if(arr.length < 2) return;
+    ctx.setLineDash(dash);
+    ctx.strokeStyle = '#f2f2f0';
+    ctx.lineWidth = 2 * devicePixelRatio;
+    ctx.beginPath();
+    arr.forEach((v,i)=>{
+      const x = (i/(HISTORY_LEN-1)) * w;
+      const y = h - (Math.max(0,Math.min(100,v))/100)*h;
+      i===0 ? ctx.moveTo(x,y) : ctx.lineTo(x,y);
+    });
+    ctx.stroke();
+    ctx.setLineDash([]);
+  };
+  drawLine(history.ram, [1, 5]);
+  drawLine(history.gpu, [8, 6]);
+  drawLine(history.cpu, []);
+}
+resizeCanvas();
+
+function pushHistory(key, val){
+  const arr = history[key];
+  arr.push(val==null ? 0 : val);
+  if(arr.length > HISTORY_LEN) arr.shift();
+}
+
+// ---- clock ----
+function tickClock(){
+  document.getElementById('clock').textContent = new Date().toLocaleTimeString('en-US', {hour12:false});
+}
+setInterval(tickClock, 1000); tickClock();
+
+// ---- main poll ----
+async function poll(){
+  try{
+    const res = await fetch('/api/stats', {cache:'no-store'});
+    if(!res.ok) throw new Error('bad status');
+    const d = await res.json();
+    render(d);
+    setPill(null, document.getElementById('live-dot'), document.getElementById('live-label'), true, 'live');
+  }catch(e){
+    setPill(null, document.getElementById('live-dot'), document.getElementById('live-label'), false, 'disconnected');
+  }
+}
+
+function render(d){
+  document.getElementById('hostname').textContent = d.hostname || 'offr';
+  document.getElementById('uptime').textContent = fmtUptime(d.uptime_s);
+
+  // CPU
+  document.getElementById('cpu-pct').innerHTML = d.cpu.pct.toFixed(0) + '<span class="unit">%</span>';
+  document.getElementById('cpu-count').textContent = d.cpu.count_logical + ' cores';
+  setBar(document.getElementById('cpu-bar'), d.cpu.pct);
+  document.getElementById('cpu-load').textContent =
+    `load avg ${d.cpu.load1.toFixed(2)} · ${d.cpu.load5.toFixed(2)} · ${d.cpu.load15.toFixed(2)}`;
+  const coresEl = document.getElementById('cpu-cores');
+  if(coresEl.children.length !== d.cpu.per_core.length){
+    coresEl.innerHTML = d.cpu.per_core.map(()=>'<i><b></b></i>').join('');
+  }
+  d.cpu.per_core.forEach((v,i)=>{ coresEl.children[i].firstElementChild.style.height = Math.max(2,v)+'%'; });
+  pushHistory('cpu', d.cpu.pct);
+
+  // MEM
+  document.getElementById('mem-pct').innerHTML = d.mem.pct.toFixed(0) + '<span class="unit">%</span>';
+  document.getElementById('mem-total').textContent = d.mem.total_gb + ' GB';
+  document.getElementById('mem-used').textContent = `${d.mem.used_gb} / ${d.mem.total_gb} GB`;
+  setBar(document.getElementById('mem-bar'), d.mem.pct);
+  document.getElementById('swap-val').textContent =
+    d.mem.swap_total_gb ? `${d.mem.swap_used_gb} / ${d.mem.swap_total_gb} GB (${d.mem.swap_pct.toFixed(0)}%)` : 'none';
+  pushHistory('ram', d.mem.pct);
+
+  // GPU
+  const g = d.gpu;
+  if(g.available){
+    document.getElementById('gpu-name').textContent = g.name || 'GPU';
+    document.getElementById('gpu-pct').innerHTML = (g.utilization_pct??0).toFixed(0) + '<span class="unit">%</span>';
+    setBar(document.getElementById('gpu-bar'), g.utilization_pct);
+    document.getElementById('gpu-vram').textContent = g.mem_total_mb
+      ? `${(g.mem_used_mb/1024).toFixed(1)} / ${(g.mem_total_mb/1024).toFixed(1)} GB` : '—';
+    document.getElementById('gpu-temp').textContent = g.temp_c!=null ? g.temp_c.toFixed(0)+' °C' : '—';
+    document.getElementById('gpu-power').textContent = g.power_w!=null ? g.power_w.toFixed(1)+' W' : '—';
+    document.getElementById('gpu-fan').textContent = g.fan_pct!=null ? g.fan_pct.toFixed(0)+' %' : '—';
+    pushHistory('gpu', g.utilization_pct);
+  } else {
+    document.getElementById('gpu-name').textContent = 'unavailable';
+    document.getElementById('gpu-pct').innerHTML = '—';
+    setBar(document.getElementById('gpu-bar'), 0);
+    pushHistory('gpu', 0);
+  }
+
+  // OLLAMA
+  const o = d.ollama;
+  setPill(document.getElementById('ollama-pill'), document.getElementById('ollama-pill').querySelector('.dot'),
+          document.getElementById('ollama-pill-label'), o.reachable, o.reachable ? 'online' : 'offline');
+  const list = document.getElementById('ollama-models');
+  if(!o.reachable){
+    list.innerHTML = '<div class="empty">can\'t reach local Ollama server</div>';
+  } else if(!o.models.length){
+    list.innerHTML = '<div class="empty">no models pulled</div>';
+  } else {
+    const runningNames = new Set((o.running||[]).map(r=>r.name));
+    list.innerHTML = o.models.map(m=>{
+      const running = runningNames.has(m.name);
+      const meta = [m.param_size, m.quant, m.size_gb ? m.size_gb+' GB' : null].filter(Boolean).join(' · ');
+      return `<div class="model${running?' running':''}"><span class="mname">${m.name}</span><span class="mmeta">${running?'running · ':''}${meta}</span></div>`;
+    }).join('');
+  }
+
+  // PLEX
+  const p = d.plex;
+  const plexOn = p.running || p.reachable;
+  setPill(document.getElementById('plex-pill'), document.getElementById('plex-pill').querySelector('.dot'),
+          document.getElementById('plex-pill-label'), plexOn, plexOn ? 'running' : 'offline');
+  document.getElementById('plex-version').textContent = p.version || '—';
+  document.getElementById('plex-streams').textContent = (p.active_streams!=null) ? p.active_streams : (p.reachable ? 'set PLEX_TOKEN' : '—');
+
+  // NET
+  document.getElementById('net-up').textContent = fmtBytesRate(d.net.up_bps);
+  document.getElementById('net-down').textContent = fmtBytesRate(d.net.down_bps);
+  document.getElementById('net-sent').textContent = d.net.total_sent_gb + ' GB';
+  document.getElementById('net-recv').textContent = d.net.total_recv_gb + ' GB';
+
+  // DISKS
+  document.getElementById('disk-count').textContent = d.disks.length + ' mounted';
+  document.getElementById('disk-rows').innerHTML = d.disks.map(dk => `
+    <div class="row">
+      <span class="lbl" title="${dk.mount}">${dk.mount}</span>
+      <div class="bar"><i style="width:${dk.pct}%"></i></div>
+      <span class="val">${dk.pct.toFixed(0)}%</span>
+    </div>`).join('');
+
+  drawScope();
+}
+
+poll();
+setInterval(poll, POLL_MS);
+</script>
+</body>
+</html>
