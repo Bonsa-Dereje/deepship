@@ -1,51 +1,31 @@
 #!/usr/bin/env python3
 """
-deepship.py  (v2 — single-site, sentence-by-sentence, browser GUI)
+deepship.py  (v3 — two independent pipelines, run one at a time)
 --------------------------------------------------------------------
-Revamped pipeline for pulling financial-aid / scholarship facts out of ONE
-college site at a time, talking to a local Ollama server running
-qwen2.5:1.5b over Tailscale. GUI is now plain HTML/CSS/JS served by a tiny
-built-in Python web server (no Tkinter, no external JS/CSS frameworks) with
-live updates pushed over Server-Sent Events (SSE).
+Pulls financial-aid / scholarship facts out of ONE college site at a time,
+talking to a local Ollama server running qwen2.5:1.5b over Tailscale. GUI is
+plain HTML/CSS/JS served by a tiny built-in Python web server (no Tkinter,
+no external JS/CSS frameworks) with live updates pushed over Server-Sent
+Events (SSE).
 
-Pipeline, per site:
+Two independent sections, each with its own Run/Stop button so you can run
+them one at a time against the same site:
 
-  1. CRAWL     — fetch the homepage, pull every <a href> out of it with
-                 BeautifulSoup.
-  2. TRIAGE    — regex-score same-domain links for finaid/scholarship-ish
-                 words first (cheap, no model call). Only if nothing scores
-                 falls back to ONE minimal call to qwen with a trimmed
-                 {index, anchor-text} list, asking for the best index.
-  3. FETCH     — fetch the chosen page.
-  4. WALK      — walk the page's DOM in document order with BeautifulSoup
-                 and turn it into a flat list of *single sentences*, each
-                 carrying a structural context tag:
-                   "heading"
-                   "paragraph"
-                   "bullet-point (start of a list)"
-                   "bullet-point (#3 in the same list as the previous
-                    bullet(s))"
-                 so a run of consecutive bullets is explicitly told to the
-                 model as such, instead of the model having to guess from
-                 stripped text.
-  5. LEARN     — one sentence at a time (never more), send the model a
-                 MINIMAL request:
-                     { "known": <trimmed knowledge so far>,
-                       "context": <tag from step 4>,
-                       "sentence": <this one sentence> }
-                 and ask it to reply with ONLY the JSON delta it can add.
-                 The "known" we hand the model is a trimmed window (last
-                 few items per list) so requests stay small and fast even
-                 on a slow local TPS -- but the CANONICAL knowledge JSON
-                 kept by the Python side never shrinks: every reply is
-                 additively merged into it (new items appended, dupes
-                 dropped), so nothing already learned gets lost just
-                 because the model didn't see it again on this request.
+  SNIPE (top section)
+    Crawl -> triage -> fetch the financial-aid page -> walk it into whole
+    PARAGRAPHS (not sentences) -> for each paragraph, ask qwen to hand back,
+    VERBATIM, any sentences in that paragraph that talk about scholarships
+    -- no summarizing, no paraphrasing, no JSON facts, just the original
+    text back. The Python side then regex-matches each returned sentence
+    against the original paragraph to find exactly where it sits, and the
+    UI highlights it in place inside the full paragraph.
 
-Every step streams live to the browser: crawl progress, the current
-sentence + its context tag, each model round-trip's latency, and the
-knowledge JSON as it grows -- plus two small live charts (latency per
-request, and sentences processed so far / total).
+  FILTER PASS (bottom section)
+    The original pipeline: same crawl/triage/fetch, then the page is walked
+    SENTENCE by sentence, and each sentence is sent to qwen one at a time
+    with a trimmed window of what's known so far, asking for a small JSON
+    delta to merge into a structured knowledge object (overview, amounts,
+    deadlines, how to apply, notes, etc).
 
 Requirements:
     pip install requests beautifulsoup4
@@ -57,7 +37,7 @@ Config (env vars, or a .env file sitting next to this script):
 Usage:
     python3 deepship.py                    # launches the web GUI (opens browser)
     python3 deepship.py --port 9000        # same, on a different port
-    python3 deepship.py princeton.edu      # headless CLI, writes a JSON file
+    python3 deepship.py princeton.edu      # headless CLI (filter-pass), writes a JSON file
     python3 deepship.py princeton.edu --output princeton_finaid.json
 """
 
@@ -115,7 +95,7 @@ OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:1.5b")
 OLLAMA_CHAT_URL = f"{OLLAMA_BASE_URL}/api/chat"
 OLLAMA_TAGS_URL = f"{OLLAMA_BASE_URL}/api/tags"
 
-HTTP_HEADERS = {"User-Agent": "Mozilla/5.0 (deepship/2.0 crawler)"}
+HTTP_HEADERS = {"User-Agent": "Mozilla/5.0 (deepship/3.0 crawler)"}
 REQUEST_TIMEOUT = 20        # page fetches
 MODEL_TIMEOUT = 120         # local model round-trips can be slow -- be patient
 MAX_RETRIES = 3             # network/model calls get this many attempts total
@@ -124,6 +104,7 @@ RETRY_BACKOFF = 2.0         # seconds, doubles each retry (2, 4, 8...)
 
 # ---------------------------------------------------------------------------
 # Knowledge JSON -- the thing that gets filled up and re-ingested every call
+# (used by the FILTER PASS pipeline only)
 # ---------------------------------------------------------------------------
 
 def empty_knowledge(college):
@@ -175,7 +156,7 @@ def merge_knowledge(canonical, model_delta):
 
 
 # ---------------------------------------------------------------------------
-# Ollama calls -- always ONE sentence, always minimal JSON
+# Ollama calls
 # ---------------------------------------------------------------------------
 
 def _strip_fences(text):
@@ -185,7 +166,7 @@ def _strip_fences(text):
     return text.strip()
 
 
-def _with_retries(fn, what, max_retries=MAX_RETRIES, backoff=RETRY_BACKOFF):
+def _with_retries(fn, what, section=None, max_retries=MAX_RETRIES, backoff=RETRY_BACKOFF):
     """Runs fn() with retries on network errors (timeouts, connection resets,
     etc). Publishes a 'retry' event to the bus between attempts so the UI can
     show it happening, instead of just dying on the first hiccup."""
@@ -199,7 +180,7 @@ def _with_retries(fn, what, max_retries=MAX_RETRIES, backoff=RETRY_BACKOFF):
                 break
             wait = backoff * (2 ** (attempt - 1))
             try:
-                bus.publish("retry", what=what, attempt=attempt, max_retries=max_retries,
+                bus.publish("retry", section=section, what=what, attempt=attempt, max_retries=max_retries,
                             wait=round(wait, 1), message=str(e))
             except NameError:
                 pass  # bus not defined yet (shouldn't happen once module is loaded)
@@ -207,9 +188,9 @@ def _with_retries(fn, what, max_retries=MAX_RETRIES, backoff=RETRY_BACKOFF):
     raise last_exc
 
 
-def _call_ollama(messages, timeout=MODEL_TIMEOUT):
+def _call_ollama(messages, timeout=MODEL_TIMEOUT, section=None, model=None):
     payload = {
-        "model": OLLAMA_MODEL,
+        "model": model or OLLAMA_MODEL,
         "stream": False,
         "messages": messages,
         "options": {"temperature": 0},
@@ -223,8 +204,10 @@ def _call_ollama(messages, timeout=MODEL_TIMEOUT):
         content = (resp.json().get("message") or {}).get("content", "")
         return _strip_fences(content), elapsed
 
-    return _with_retries(attempt, "model round-trip")
+    return _with_retries(attempt, "model round-trip", section=section)
 
+
+# --- FILTER PASS: one sentence at a time, minimal structured-JSON delta ----
 
 ASK_SYSTEM_PROMPT = (
     "You track financial-aid and scholarship facts for ONE college, one "
@@ -263,8 +246,8 @@ def format_prompt_for_display(messages):
     return "\n\n".join(f"[{m['role'].upper()}]\n{m['content']}" for m in messages)
 
 
-def ask_qwen_for_sentence(messages):
-    raw, elapsed = _call_ollama(messages)
+def ask_qwen_for_sentence(messages, section="filter", model=None):
+    raw, elapsed = _call_ollama(messages, section=section, model=model)
     try:
         delta = json.loads(raw)
         if not isinstance(delta, dict):
@@ -274,7 +257,7 @@ def ask_qwen_for_sentence(messages):
     return delta, elapsed, raw
 
 
-def ask_qwen_pick_link(links):
+def ask_qwen_pick_link(links, section=None, model=None):
     """Only used if the regex triage finds nothing. Minimal payload: index
     + short anchor text only, capped to 40 links."""
     trimmed = [{"i": i, "t": (l["text"] or l["url"])[:60]} for i, l in enumerate(links[:40])]
@@ -286,24 +269,102 @@ def ask_qwen_pick_link(links):
         {"role": "user", "content": json.dumps(trimmed, ensure_ascii=False)},
     ]
     try:
-        raw, _ = _call_ollama(messages, timeout=60)
+        raw, _ = _call_ollama(messages, timeout=60, section=section, model=model)
         idx = json.loads(raw).get("i")
         return idx if isinstance(idx, int) else None
     except Exception:
         return None
 
 
+# --- SNIPE: paragraph shown whole, but classified sentence by sentence ----
+
+SNIPE_SYSTEM_PROMPT = (
+    "You will be given ONE sentence copied exactly from a college's "
+    "financial-aid webpage, plus a context tag telling you where it came "
+    "from on the page. Answer strictly based on THIS sentence alone -- "
+    "do not assume anything that isn't stated in it. Answer two yes/no "
+    "questions: (1) \"financial_aid\" -- does this sentence talk about "
+    "financial aid, a scholarship, or a grant at all (whether it says one "
+    "is offered, not offered, who qualifies, deadlines, how to apply, "
+    "etc.)? (2) \"amount_mentioned\" -- does this sentence state a "
+    "specific amount of aid provided (a dollar figure, a percentage of "
+    "need/cost met, or similar)? Also give a short \"reason\", under 20 "
+    "words, in plain English, explaining your two answers using only "
+    "what's in the sentence. Reply with ONLY this JSON shape: "
+    "{\"financial_aid\": true|false, \"amount_mentioned\": true|false, "
+    "\"reason\": \"...\"}. No markdown, no commentary outside that JSON."
+)
+
+
+def build_snipe_sentence_messages(sentence_text, context_tag):
+    user_payload = {"context": context_tag, "sentence": sentence_text}
+    return [
+        {"role": "system", "content": SNIPE_SYSTEM_PROMPT},
+        {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False, indent=2)},
+    ]
+
+
+def ask_qwen_classify_sentence(messages, section="snipe", model=None):
+    raw, elapsed = _call_ollama(messages, section=section, model=model)
+    financial_aid, amount_mentioned, reason = False, False, ""
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            financial_aid = bool(parsed.get("financial_aid"))
+            amount_mentioned = bool(parsed.get("amount_mentioned"))
+            r = parsed.get("reason")
+            reason = r.strip() if isinstance(r, str) else ""
+    except Exception:
+        pass
+    return financial_aid, amount_mentioned, reason, elapsed, raw
+
+
+def snipe_category(financial_aid, amount_mentioned):
+    if financial_aid and amount_mentioned:
+        return "both"
+    if financial_aid:
+        return "aid"
+    if amount_mentioned:
+        return "amount"
+    return None
+
+
+def split_sentences_with_spans(text):
+    """Splits `text` into sentences AND returns each one's exact (start, end)
+    offset within `text`, so the UI can highlight precisely without any
+    regex/fuzzy matching against model output -- the model never has to
+    copy anything back, it only judges one sentence we already located."""
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return []
+    parts = [p.strip() for p in SENT_SPLIT_RE.split(text)]
+    spans, pos = [], 0
+    for part in parts:
+        if not part:
+            continue
+        idx = text.find(part, pos)
+        if idx == -1:
+            idx = text.find(part)
+        if idx == -1:
+            continue
+        start, end = idx, idx + len(part)
+        spans.append((part, start, end))
+        pos = end
+    return spans
+
+
+
 # ---------------------------------------------------------------------------
-# Crawling / extraction
+# Crawling / extraction (shared by both pipelines)
 # ---------------------------------------------------------------------------
 
-def fetch_html(url):
+def fetch_html(url, section=None):
     def attempt():
         r = requests.get(url, headers=HTTP_HEADERS, timeout=REQUEST_TIMEOUT)
         r.raise_for_status()
         return r.text
 
-    return _with_retries(attempt, f"fetch {url}")
+    return _with_retries(attempt, f"fetch {url}", section=section)
 
 
 def extract_links(base_url, html):
@@ -346,28 +407,23 @@ def split_sentences(text):
     return [p.strip() for p in SENT_SPLIT_RE.split(text) if p.strip()]
 
 
-def walk_items(html):
-    """Walk the page in document order, flattening it into single sentences,
-    each tagged with structural context -- headings, plain paragraphs, and
-    bullet points explicitly numbered within their own <ul>/<ol> run so
-    consecutive bullets are called out as such."""
+def _walk_blocks_raw(html):
+    """Shared DOM walk: yields (element_name, text, context_tag) in document
+    order for headings/paragraphs/list-items, tagging bullets that belong to
+    the same list run just like the original single-pass walker did."""
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup(["script", "style", "noscript", "nav", "footer", "header"]):
         tag.decompose()
 
-    items = []
     bullet_pos = {}  # id(parent list) -> how many bullets seen so far in it
-
-    def emit(block_text, context):
-        for s in split_sentences(block_text):
-            items.append({"text": s, "context": context})
 
     for el in soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6", "p", "li"]):
         txt = el.get_text(" ", strip=True)
+        txt = re.sub(r"\s+", " ", txt).strip()
         if not txt:
             continue
         if el.name.startswith("h"):
-            emit(txt, "heading")
+            yield el.name, txt, "heading"
         elif el.name == "li":
             parent_list = el.find_parent(["ul", "ol"])
             key = id(parent_list) if parent_list else id(el)
@@ -375,9 +431,28 @@ def walk_items(html):
             pos = bullet_pos[key]
             tag = ("bullet-point (start of a list)" if pos == 1 else
                    f"bullet-point (#{pos} in the same list as the previous bullet(s))")
-            emit(txt, tag)
+            yield el.name, txt, tag
         else:
-            emit(txt, "paragraph")
+            yield el.name, txt, "paragraph"
+
+
+def walk_items(html):
+    """FILTER PASS granularity: flattens the page into single sentences,
+    each tagged with structural context."""
+    items = []
+    for _el_name, txt, context in _walk_blocks_raw(html):
+        for s in split_sentences(txt):
+            items.append({"text": s, "context": context})
+    return items
+
+
+def walk_blocks(html):
+    """SNIPE granularity: the SAME structural walk, but each block (a whole
+    <p>, a whole <li>, a whole heading) is kept intact -- an entire
+    paragraph handed to the model in one piece, never split into sentences."""
+    items = []
+    for _el_name, txt, context in _walk_blocks_raw(html):
+        items.append({"text": txt, "context": context})
     return items
 
 
@@ -411,80 +486,173 @@ class EventBus:
 
 
 bus = EventBus()
-RUN_STATE = {"running": False, "stop_flag": False}
+
+# Each section runs fully independently -- its own running/stop_flag -- so
+# the UI can offer one Run button per section and the person can fire them
+# off one at a time (or, technically, in parallel, though the UI is built
+# for "one at a time").
+RUN_STATE = {
+    "snipe": {"running": False, "stop_flag": False},
+    "filter": {"running": False, "stop_flag": False},
+}
+
+
+def _find_candidate_page(section, site, model=None):
+    """Crawl + triage, shared by both pipelines. Returns (base_url, host,
+    candidate_link) or None (having already published an error event)."""
+    site = (site or "").strip()
+    if not site:
+        bus.publish("error", section=section, message="No site given.")
+        return None
+    base_url = site if site.startswith("http") else f"https://{site}"
+    host = urlparse(base_url).netloc or site
+
+    bus.publish("crawl_start", section=section, site=site)
+    html = fetch_html(base_url, section=section)
+    links = extract_links(base_url, html)
+    bus.publish("crawl_done", section=section, link_count=len(links),
+                sample=[l["url"] for l in links[:15]])
+
+    if RUN_STATE[section]["stop_flag"]:
+        bus.publish("stopped", section=section)
+        return None
+
+    candidate = guess_finaid_link(links, host)
+    if not candidate:
+        bus.publish("triage_fallback", section=section,
+                    message="regex triage found nothing -- asking qwen to pick a link")
+        idx = ask_qwen_pick_link(links, section=section, model=model)
+        candidate = links[idx] if isinstance(idx, int) and 0 <= idx < len(links) else None
+    if not candidate:
+        bus.publish("error", section=section, message="Could not find a financial-aid-looking page on this site.")
+        return None
+
+    bus.publish("candidate_found", section=section, url=candidate["url"], anchor_text=candidate.get("text", ""))
+    return base_url, host, candidate
 
 
 # ---------------------------------------------------------------------------
-# The pipeline itself -- single site, one sentence at a time
+# FILTER PASS pipeline -- one sentence at a time, structured knowledge JSON
 # ---------------------------------------------------------------------------
 
-def run_pipeline(site):
-    if RUN_STATE["running"]:
-        bus.publish("error", message="A run is already in progress.")
+def run_pipeline_filter(site, model=None):
+    section = "filter"
+    if RUN_STATE[section]["running"]:
+        bus.publish("error", section=section, message="A filter-pass run is already in progress.")
         return
-    RUN_STATE["running"] = True
-    RUN_STATE["stop_flag"] = False
+    RUN_STATE[section]["running"] = True
+    RUN_STATE[section]["stop_flag"] = False
     try:
-        site = (site or "").strip()
-        if not site:
-            bus.publish("error", message="No site given.")
+        found = _find_candidate_page(section, site, model=model)
+        if not found:
             return
-        base_url = site if site.startswith("http") else f"https://{site}"
-        host = urlparse(base_url).netloc or site
+        base_url, host, candidate = found
 
-        bus.publish("crawl_start", site=site)
-        html = fetch_html(base_url)
-        links = extract_links(base_url, html)
-        bus.publish("crawl_done", link_count=len(links),
-                    sample=[l["url"] for l in links[:15]])
+        if RUN_STATE[section]["stop_flag"]:
+            bus.publish("stopped", section=section); return
 
-        if RUN_STATE["stop_flag"]:
-            bus.publish("stopped"); return
-
-        candidate = guess_finaid_link(links, host)
-        if not candidate:
-            bus.publish("triage_fallback", message="regex triage found nothing -- asking qwen to pick a link")
-            idx = ask_qwen_pick_link(links)
-            candidate = links[idx] if isinstance(idx, int) and 0 <= idx < len(links) else None
-        if not candidate:
-            bus.publish("error", message="Could not find a financial-aid-looking page on this site.")
-            return
-
-        bus.publish("candidate_found", url=candidate["url"], anchor_text=candidate.get("text", ""))
-
-        if RUN_STATE["stop_flag"]:
-            bus.publish("stopped"); return
-
-        page_html = fetch_html(candidate["url"])
+        page_html = fetch_html(candidate["url"], section=section)
         items = walk_items(page_html)
-        bus.publish("page_extracted", url=candidate["url"], item_count=len(items))
+        bus.publish("page_extracted", section=section, url=candidate["url"], item_count=len(items))
 
         knowledge = empty_knowledge(host)
         for i, item in enumerate(items):
-            if RUN_STATE["stop_flag"]:
-                bus.publish("stopped"); break
+            if RUN_STATE[section]["stop_flag"]:
+                bus.publish("stopped", section=section); break
 
             messages = build_ask_messages(knowledge, item["text"], item["context"])
             full_prompt = format_prompt_for_display(messages)
 
-            bus.publish("sentence_start", index=i, total=len(items),
+            bus.publish("sentence_start", section=section, index=i, total=len(items),
                         text=item["text"], context=item["context"], prompt=full_prompt)
 
-            delta, elapsed, raw = ask_qwen_for_sentence(messages)
+            delta, elapsed, raw = ask_qwen_for_sentence(messages, section=section, model=model)
             knowledge = merge_knowledge(knowledge, delta)
 
-            bus.publish("sentence_done", index=i, total=len(items),
+            bus.publish("sentence_done", section=section, index=i, total=len(items),
                         elapsed=round(elapsed, 2), delta=delta, knowledge=knowledge, raw=raw[:600],
                         prompt=full_prompt)
 
-        bus.publish("run_done", knowledge=knowledge, stopped_early=RUN_STATE["stop_flag"])
+        bus.publish("run_done", section=section, knowledge=knowledge, stopped_early=RUN_STATE[section]["stop_flag"])
         return knowledge
     except requests.RequestException as e:
-        bus.publish("error", message=f"network error: {e}")
+        bus.publish("error", section=section, message=f"network error: {e}")
     except Exception as e:
-        bus.publish("error", message=str(e))
+        bus.publish("error", section=section, message=str(e))
     finally:
-        RUN_STATE["running"] = False
+        RUN_STATE[section]["running"] = False
+
+
+# ---------------------------------------------------------------------------
+# SNIPE pipeline -- whole paragraphs, verbatim scholarship sentences back
+# ---------------------------------------------------------------------------
+
+def run_pipeline_snipe(site, model=None):
+    section = "snipe"
+    if RUN_STATE[section]["running"]:
+        bus.publish("error", section=section, message="A snipe run is already in progress.")
+        return
+    RUN_STATE[section]["running"] = True
+    RUN_STATE[section]["stop_flag"] = False
+    try:
+        found = _find_candidate_page(section, site, model=model)
+        if not found:
+            return
+        base_url, host, candidate = found
+
+        if RUN_STATE[section]["stop_flag"]:
+            bus.publish("stopped", section=section); return
+
+        page_html = fetch_html(candidate["url"], section=section)
+        blocks = walk_blocks(page_html)
+        bus.publish("page_extracted", section=section, url=candidate["url"], item_count=len(blocks))
+
+        all_hits = []
+        for i, block in enumerate(blocks):
+            if RUN_STATE[section]["stop_flag"]:
+                bus.publish("stopped", section=section); break
+
+            bus.publish("para_start", section=section, index=i, total=len(blocks),
+                        text=block["text"], context=block["context"])
+
+            spans = split_sentences_with_spans(block["text"])
+            block_hit_count = 0
+            for j, (sentence, start, end) in enumerate(spans):
+                if RUN_STATE[section]["stop_flag"]:
+                    bus.publish("stopped", section=section); break
+
+                messages = build_snipe_sentence_messages(sentence, block["context"])
+                bus.publish("sentence_check_start", section=section, index=i, total=len(blocks),
+                            sent_index=j, sent_total=len(spans), sentence=sentence)
+
+                financial_aid, amount_mentioned, reason, elapsed, raw = ask_qwen_classify_sentence(
+                    messages, section=section, model=model)
+                category = snipe_category(financial_aid, amount_mentioned)
+
+                if category:
+                    block_hit_count += 1
+                    all_hits.append({
+                        "index": i, "sentence": sentence, "category": category, "reason": reason,
+                        "context": block["context"], "url": candidate["url"],
+                    })
+
+                bus.publish("sentence_check_done", section=section, index=i, total=len(blocks),
+                            sent_index=j, sent_total=len(spans), sentence=sentence, start=start, end=end,
+                            context=block["context"], financial_aid=financial_aid, amount_mentioned=amount_mentioned,
+                            reason=reason, category=category, elapsed=round(elapsed, 2), hits_so_far=len(all_hits))
+
+            bus.publish("para_done", section=section, index=i, total=len(blocks),
+                        context=block["context"], text=block["text"],
+                        hit=block_hit_count > 0, hit_count=block_hit_count, hits_so_far=len(all_hits))
+
+        bus.publish("run_done", section=section, hits=all_hits, stopped_early=RUN_STATE[section]["stop_flag"])
+        return all_hits
+    except requests.RequestException as e:
+        bus.publish("error", section=section, message=f"network error: {e}")
+    except Exception as e:
+        bus.publish("error", section=section, message=str(e))
+    finally:
+        RUN_STATE[section]["running"] = False
 
 
 # ---------------------------------------------------------------------------
@@ -506,6 +674,10 @@ INDEX_HTML = """<!DOCTYPE html>
     --c-bullet:#1d4ed8; --c-heading:#b35c00; --c-paragraph:#5c5c5c;
     --c-financial_aid_overview:#2563eb; --c-scholarships:#7c3aed; --c-amounts:#059669;
     --c-deadlines:#dc2626; --c-how_to_apply:#d97706; --c-notes:#64748b;
+    --snipe-accent:#7c3aed; --snipe-accent-bg:#f5f0ff;
+    --c-hit-aid:#1a7f37; --c-hit-aid-bg:#dcf5e4;
+    --c-hit-amount:#1d4ed8; --c-hit-amount-bg:#dfe9ff;
+    --c-hit-both:#7c3aed; --c-hit-both-bg:#ede4fd;
     --font:-apple-system,BlinkMacSystemFont,"SF Pro Text","Helvetica Neue",Arial,sans-serif;
     --mono:"SF Mono", ui-monospace, Menlo, Consolas, monospace;
   }
@@ -529,22 +701,40 @@ INDEX_HTML = """<!DOCTYPE html>
     border-radius:8px;padding:9px 12px;font-family:var(--font);font-size:14px;outline:none;
   }
   .sitebox input:focus{border-color:#1a1a1a;}
+  .sitebox .hint{font-size:11.5px;color:var(--muted);width:100%;}
   button{
     border:1px solid var(--border-strong);background:transparent;color:var(--muted-strong);
     border-radius:8px;padding:9px 16px;cursor:pointer;font-family:var(--font);font-size:13px;
-    transition:border-color .15s,color .15s,background .15s;
+    transition:border-color .15s,color .15s,background .15s;white-space:nowrap;
   }
   button:hover:not(:disabled){color:var(--text);border-color:#1a1a1a;}
   button.primary{background:#1a1a1a;color:#fff;border-color:#1a1a1a;}
   button.primary:hover:not(:disabled){opacity:.85;}
+  button.primary.snipe-btn{background:var(--snipe-accent);border-color:var(--snipe-accent);}
   button:disabled{cursor:not-allowed;opacity:.45;}
 
-  #banner{max-width:1400px;margin:12px auto 0;padding:0 24px;}
-
-  .twocol{
-    max-width:1400px;margin:0 auto;padding:16px 24px 60px;
-    display:grid;grid-template-columns:1fr 1fr;gap:20px;align-items:start;
+  /* ---- full-width section boxes: SNIPE and FILTER PASS each get one ---- */
+  .section-box{
+    max-width:1400px;margin:20px auto 0;padding:20px 22px 26px;border:1px solid var(--border);
+    border-radius:16px;background:var(--panel);
   }
+  .section-box:last-of-type{margin-bottom:40px;}
+  .section-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;flex-wrap:wrap;
+    border-bottom:1px solid var(--border);padding-bottom:14px;margin-bottom:16px;}
+  .section-head .titles{display:flex;flex-direction:column;gap:3px;}
+  .section-head h2.section-title{font-size:16px;font-weight:700;margin:0;letter-spacing:-.1px;}
+  .section-head .section-desc{font-size:12px;color:var(--muted);max-width:640px;line-height:1.5;}
+  .section-head .controls{display:flex;gap:8px;align-items:center;}
+  .section-eyebrow{
+    display:inline-block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;
+    padding:2px 8px;border-radius:5px;margin-bottom:4px;width:fit-content;
+  }
+  .section-eyebrow.snipe{color:var(--snipe-accent);background:var(--snipe-accent-bg);}
+  .section-eyebrow.filter{color:#191919;background:var(--pill-bg);}
+
+  #snipeBanner, #filterBanner{margin-bottom:14px;}
+
+  .twocol{display:grid;grid-template-columns:1fr 1fr;gap:20px;align-items:start;}
   .col{display:flex;flex-direction:column;gap:16px;}
   @media (max-width:980px){.twocol{grid-template-columns:1fr;}}
 
@@ -552,7 +742,7 @@ INDEX_HTML = """<!DOCTYPE html>
   @media (max-width:640px){.grid{grid-template-columns:1fr;}}
 
   .card{border:1px solid var(--border);border-radius:12px;padding:16px 18px;background:var(--panel);}
-  .card h2{font-size:12.5px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;
+  .card h3{font-size:12.5px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;
     color:var(--muted-strong);margin:0 0 10px;}
   .card .empty{color:var(--muted);font-size:13px;}
 
@@ -564,12 +754,43 @@ INDEX_HTML = """<!DOCTYPE html>
   .pill.heading{background:#fff3e0;color:var(--c-heading);}
   .pill.paragraph{background:#f2f2f2;color:var(--c-paragraph);}
 
-  #sentenceText{font-size:14.5px;line-height:1.55;margin:4px 0 8px;}
-  #sentenceMeta{font-size:11.5px;color:var(--muted);}
+  #sentenceText, #paraText{font-size:14.5px;line-height:1.65;margin:4px 0 8px;}
+  #sentenceMeta, #paraMeta{font-size:11.5px;color:var(--muted);}
+
+  mark.snipe-hit{
+    padding:1px 3px;border-radius:4px;font-weight:600;
+    box-decoration-break:clone;-webkit-box-decoration-break:clone;
+  }
+  mark.snipe-hit.cat-aid{background:var(--c-hit-aid-bg);color:#0f5023;}
+  mark.snipe-hit.cat-amount{background:var(--c-hit-amount-bg);color:#122a80;}
+  mark.snipe-hit.cat-both{background:var(--c-hit-both-bg);color:#3b1a78;}
+
+  .snipe-legend{display:flex;flex-wrap:wrap;gap:14px;margin-top:12px;font-size:11.5px;color:var(--muted-strong);}
+  .snipe-legend .item{display:flex;align-items:center;gap:6px;}
+  .snipe-legend .swatch{width:11px;height:11px;border-radius:3px;display:inline-block;}
+  .snipe-legend .swatch.cat-aid{background:var(--c-hit-aid);}
+  .snipe-legend .swatch.cat-amount{background:var(--c-hit-amount);}
+  .snipe-legend .swatch.cat-both{background:var(--c-hit-both);}
+
+  .snipe-reason-box{
+    margin-top:10px;padding:9px 12px;border-radius:8px;background:var(--pill-bg);border:1px solid var(--border);
+    font-size:12px;line-height:1.55;color:var(--muted-strong);min-height:18px;
+  }
+  .snipe-reason-box .rb-sentence{color:var(--text);font-weight:600;display:block;margin-bottom:2px;}
+  .snipe-reason-box .rb-flags{display:inline-flex;gap:8px;margin-right:8px;font-size:10.5px;text-transform:uppercase;letter-spacing:.03em;}
+  .snipe-reason-box .rb-flag-on{color:var(--c-hit-both);}
+  .snipe-reason-box .rb-flag-off{color:var(--muted);}
+
+  .model-picker{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);}
+  .model-picker select{
+    background:#fff;border:1px solid var(--border-strong);color:var(--text);border-radius:8px;
+    padding:7px 10px;font-family:var(--font);font-size:12.5px;outline:none;max-width:220px;
+  }
 
   progress{width:100%;height:8px;border-radius:6px;overflow:hidden;border:none;}
   progress::-webkit-progress-bar{background:var(--pill-bg);border-radius:6px;}
   progress::-webkit-progress-value{background:#1a1a1a;border-radius:6px;}
+  #snipeProgressBar::-webkit-progress-value{background:var(--snipe-accent);}
 
   pre#knowledgeView{
     font-family:var(--mono);font-size:12px;line-height:1.5;white-space:pre-wrap;word-break:break-word;
@@ -584,17 +805,17 @@ INDEX_HTML = """<!DOCTYPE html>
   .msg-error{color:var(--error);background:var(--error-bg);padding:10px 14px;border-radius:10px;font-size:13px;}
   .msg-good{color:var(--good);background:var(--good-bg);padding:10px 14px;border-radius:10px;font-size:13px;}
 
-  #log, #logTable{font-family:var(--mono);font-size:11.5px;line-height:1.7;color:var(--muted-strong);
+  #snipeLog, #log, #logTable{font-family:var(--mono);font-size:11.5px;line-height:1.7;color:var(--muted-strong);
     max-height:200px;overflow-y:auto;}
-  #log .row, #logTable .row{white-space:pre-wrap;word-break:break-word;}
+  #snipeLog .row, #log .row, #logTable .row{white-space:pre-wrap;word-break:break-word;}
 
   pre#promptView{
     font-family:var(--mono);font-size:11px;line-height:1.5;white-space:pre-wrap;word-break:break-word;
-    max-height:260px;overflow-y:auto;margin:10px 0 0;padding:10px 12px;border-radius:8px;
+    max-height:220px;overflow-y:auto;margin:10px 0 0;padding:10px 12px;border-radius:8px;
     background:var(--pill-bg);color:var(--text);border:1px solid var(--border);
   }
 
-  /* -- right column: extracted-data boxes + node graph -- */
+  /* -- extracted-data boxes (filter pass) -- */
   .extracted-grid{display:flex;flex-wrap:wrap;gap:8px;max-height:230px;overflow-y:auto;align-content:flex-start;}
   .extracted-box{
     border-radius:8px;border:1.4px solid var(--border-strong);padding:8px 10px;font-size:11.5px;
@@ -607,8 +828,23 @@ INDEX_HTML = """<!DOCTYPE html>
   .extracted-box .exb-idx{color:var(--muted);font-weight:400;text-transform:none;letter-spacing:0;}
   .extracted-box .exb-text{color:var(--text);word-break:break-word;}
 
-  /* -- bottom full-width section: data extrapolation table -- */
-  .full-width-section{max-width:1400px;margin:0 auto;padding:0 24px 60px;}
+  /* -- snipe hit list (verbatim scholarship sentences found) -- */
+  .snipe-hit-list{display:flex;flex-direction:column;gap:8px;max-height:420px;overflow-y:auto;}
+  .snipe-hit-card{
+    border:1.4px solid var(--border-strong);border-left-width:4px;border-radius:10px;padding:10px 12px;background:#fff;
+    animation:pop .18s ease-out;
+  }
+  .snipe-hit-card.cat-aid{border-color:var(--c-hit-aid);background:var(--c-hit-aid-bg);}
+  .snipe-hit-card.cat-amount{border-color:var(--c-hit-amount);background:var(--c-hit-amount-bg);}
+  .snipe-hit-card.cat-both{border-color:var(--c-hit-both);background:var(--c-hit-both-bg);}
+  .snipe-hit-card .shc-head{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.03em;
+    margin-bottom:5px;display:flex;justify-content:space-between;gap:8px;}
+  .snipe-hit-card.cat-aid .shc-head{color:#0f5023;}
+  .snipe-hit-card.cat-amount .shc-head{color:#122a80;}
+  .snipe-hit-card.cat-both .shc-head{color:#3b1a78;}
+  .snipe-hit-card .shc-text{font-size:13px;line-height:1.5;color:var(--text);}
+
+  /* -- full-width sub-section: data extrapolation table (filter pass) -- */
   .extrap-wrap{overflow-x:auto;}
   table.extrap-table{width:100%;border-collapse:collapse;font-size:12.5px;}
   table.extrap-table th{
@@ -657,73 +893,138 @@ INDEX_HTML = """<!DOCTYPE html>
 <div class="sitebox">
   <label for="siteInput">Site to be crawled</label>
   <input id="siteInput" type="text" placeholder="e.g. princeton.edu" spellcheck="false">
-  <button class="primary" id="startBtn">Start</button>
-  <button id="stopBtn" disabled>Stop</button>
+  <span class="hint">Shared by both sections below — hit a section's own Run button to use it there.</span>
 </div>
 
-<div id="banner"></div>
-
-<div class="twocol">
-
-  <!-- LEFT: everything the dashboard already showed -->
-  <div class="col">
-    <div class="card">
-      <h2>Crawl</h2>
-      <div id="crawlBody" class="empty">Nothing yet — enter a site and hit Start.</div>
-      <div class="links-sample" id="linksSample"></div>
+<!-- ======================= SNIPE SECTION ======================= -->
+<div class="section-box" id="snipeSection">
+  <div class="section-head">
+    <div class="titles">
+      <span class="section-eyebrow snipe">Snipe</span>
+      <h2 class="section-title">Financial aid / scholarship / grant highlighter</h2>
+      <div class="section-desc">The paragraph is shown below exactly as found on the page. In the background it's
+        split into individual sentences, and each one is sent to the model on its own with two yes/no questions —
+        does it talk about financial aid/scholarships/grants, and does it state an amount — plus a short reason
+        (shown for context only, not used for anything). Matching sentences get highlighted in place, color-coded.</div>
     </div>
-
-    <div class="grid">
-      <div class="card">
-        <h2>Current sentence</h2>
-        <div id="contextPill"></div>
-        <div id="sentenceText" class="empty">—</div>
-        <div id="sentenceMeta"></div>
-        <progress id="progressBar" value="0" max="1"></progress>
-        <div class="chart-label" style="margin-top:10px;">Prompt sent to the model (full, this request)</div>
-        <pre id="promptView" class="empty">—</pre>
-      </div>
-      <div class="card">
-        <h2>Model round-trips</h2>
-        <div class="chart-label">latency per request (s)</div>
-        <canvas id="latencyChart" width="420" height="90"></canvas>
-        <div class="chart-label" style="margin-top:10px;">sentences processed / total — <span style="color:#1a7f37;">green</span> = hit (useful info), <span style="color:#999;">grey</span> = miss (just another sentence)</div>
-        <canvas id="progressChart" width="420" height="90"></canvas>
-      </div>
-    </div>
-
-    <div class="card">
-      <h2>Knowledge so far <span style="color:var(--muted);font-weight:400;">(re-sent, trimmed, on every request — grown, never lost, here)</span></h2>
-      <pre id="knowledgeView" class="empty">{}</pre>
+    <div class="controls">
+      <div class="model-picker"><label for="snipeModelSelect">Model</label><select id="snipeModelSelect"></select></div>
+      <button class="primary snipe-btn" id="snipeStartBtn">Run Snipe</button>
+      <button id="snipeStopBtn" disabled>Stop</button>
     </div>
   </div>
 
-  <!-- RIGHT: extracted-data boxes, node graph of chunk -> sentence -> fact, then the event log -->
-  <div class="col">
-    <div class="card">
-      <h2>Extracted data <span id="extractedCount" style="color:var(--muted);font-weight:400;text-transform:none;"></span></h2>
-      <div id="extractedBoxes" class="extracted-grid">
-        <div class="empty" id="extractedEmpty">Nothing extracted yet — a box appears here every time a sentence yields a useful fact.</div>
-      </div>
-    </div>
+  <div id="snipeBanner"></div>
 
-    <div class="card" id="graphCard">
-      <h2>Chunk → sentence → knowledge graph</h2>
-      <div id="graphWrap"><svg id="nodeGraph" viewBox="0 0 640 520"></svg></div>
-      <div class="legend" id="legend"></div>
-    </div>
+  <div class="card" style="margin-bottom:16px;">
+    <h3>Crawl</h3>
+    <div id="snipeCrawlBody" class="empty">Nothing yet — enter a site above and hit Run Snipe.</div>
+    <div class="links-sample" id="snipeLinksSample"></div>
+  </div>
 
-    <div class="card">
-      <h2>Event log</h2>
-      <div id="log"></div>
+  <div class="card" style="margin-bottom:16px;">
+    <h3>Current paragraph <span style="color:var(--muted);font-weight:400;">(shown whole — checked one sentence at a time in the background)</span></h3>
+    <div id="paraPill"></div>
+    <div id="paraText" class="empty">—</div>
+    <div id="paraMeta"></div>
+    <progress id="snipeProgressBar" value="0" max="1"></progress>
+    <div class="snipe-reason-box" id="snipeReasonBox"><span class="empty">The sentence being checked, and the model's reason, appear here as it works through the paragraph.</span></div>
+    <div class="snipe-legend">
+      <span class="item"><span class="swatch cat-aid"></span>talks about financial aid / a scholarship / a grant</span>
+      <span class="item"><span class="swatch cat-amount"></span>states an amount</span>
+      <span class="item"><span class="swatch cat-both"></span>both in one sentence</span>
     </div>
   </div>
 
-</div>
+  <div class="card" style="margin-bottom:16px;">
+    <h3>Sentences found <span id="snipeHitCount" style="color:var(--muted);font-weight:400;"></span></h3>
+    <div class="snipe-hit-list" id="snipeHitList">
+      <div class="empty" id="snipeHitEmpty">Nothing found yet — a card appears here every time the model returns a matching sentence, verbatim.</div>
+    </div>
+  </div>
 
-<div class="full-width-section">
   <div class="card">
-    <h2>Data extrapolation <span style="color:var(--muted);font-weight:400;text-transform:none;">— which sentence(s) produced which fact</span></h2>
+    <h3>Event log</h3>
+    <div id="snipeLog"></div>
+  </div>
+</div>
+
+<!-- ======================= FILTER PASS SECTION ======================= -->
+<div class="section-box" id="filterSection">
+  <div class="section-head">
+    <div class="titles">
+      <span class="section-eyebrow filter">Filter pass</span>
+      <h2 class="section-title">Structured knowledge extraction (sentence-by-sentence)</h2>
+      <div class="section-desc">The original pipeline: walks the page one sentence at a time and asks the model for a
+        small JSON delta each time, additively merged into a structured knowledge object.</div>
+    </div>
+    <div class="controls">
+      <div class="model-picker"><label for="filterModelSelect">Model</label><select id="filterModelSelect"></select></div>
+      <button class="primary" id="filterStartBtn">Run Filter pass</button>
+      <button id="filterStopBtn" disabled>Stop</button>
+    </div>
+  </div>
+
+  <div id="filterBanner"></div>
+
+  <div class="card" style="margin-bottom:16px;">
+    <h3>Crawl</h3>
+    <div id="crawlBody" class="empty">Nothing yet — enter a site above and hit Run Filter pass.</div>
+    <div class="links-sample" id="linksSample"></div>
+  </div>
+
+  <div class="twocol">
+
+    <div class="col">
+      <div class="grid">
+        <div class="card">
+          <h3>Current sentence</h3>
+          <div id="contextPill"></div>
+          <div id="sentenceText" class="empty">—</div>
+          <div id="sentenceMeta"></div>
+          <progress id="progressBar" value="0" max="1"></progress>
+          <div class="chart-label" style="margin-top:10px;">Prompt sent to the model (full, this request)</div>
+          <pre id="promptView" class="empty">—</pre>
+        </div>
+        <div class="card">
+          <h3>Model round-trips</h3>
+          <div class="chart-label">latency per request (s)</div>
+          <canvas id="latencyChart" width="420" height="90"></canvas>
+          <div class="chart-label" style="margin-top:10px;">sentences processed / total — <span style="color:#1a7f37;">green</span> = hit (useful info), <span style="color:#999;">grey</span> = miss (just another sentence)</div>
+          <canvas id="progressChart" width="420" height="90"></canvas>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>Knowledge so far <span style="color:var(--muted);font-weight:400;">(re-sent, trimmed, on every request — grown, never lost, here)</span></h3>
+        <pre id="knowledgeView" class="empty">{}</pre>
+      </div>
+    </div>
+
+    <div class="col">
+      <div class="card">
+        <h3>Extracted data <span id="extractedCount" style="color:var(--muted);font-weight:400;text-transform:none;"></span></h3>
+        <div id="extractedBoxes" class="extracted-grid">
+          <div class="empty" id="extractedEmpty">Nothing extracted yet — a box appears here every time a sentence yields a useful fact.</div>
+        </div>
+      </div>
+
+      <div class="card" id="graphCard">
+        <h3>Chunk → sentence → knowledge graph</h3>
+        <div id="graphWrap"><svg id="nodeGraph" viewBox="0 0 640 520"></svg></div>
+        <div class="legend" id="legend"></div>
+      </div>
+
+      <div class="card">
+        <h3>Event log</h3>
+        <div id="log"></div>
+      </div>
+    </div>
+
+  </div>
+
+  <div class="card" style="margin-top:16px;">
+    <h3>Data extrapolation <span style="color:var(--muted);font-weight:400;text-transform:none;">— which sentence(s) produced which fact</span></h3>
     <div class="extrap-wrap">
       <table class="extrap-table">
         <thead>
@@ -737,7 +1038,7 @@ INDEX_HTML = """<!DOCTYPE html>
   </div>
 
   <div class="card" style="margin-top:16px;">
-    <h2>Event log</h2>
+    <h3>Event log</h3>
     <div id="logTable"></div>
   </div>
 </div>
@@ -745,75 +1046,30 @@ INDEX_HTML = """<!DOCTYPE html>
 <script>
 (function(){
   const el = (id) => document.getElementById(id);
-  const siteInput = el('siteInput'), startBtn = el('startBtn'), stopBtn = el('stopBtn');
-  const statusText = el('statusText'), banner = el('banner');
-  const crawlBody = el('crawlBody'), linksSample = el('linksSample');
-  const contextPill = el('contextPill'), sentenceText = el('sentenceText'), sentenceMeta = el('sentenceMeta');
-  const progressBar = el('progressBar'), knowledgeView = el('knowledgeView'), logEl = el('log');
-  const logTableEl = el('logTable'), promptView = el('promptView');
-  const latencyCanvas = el('latencyChart'), progressCanvas = el('progressChart');
-  const extractedBoxes = el('extractedBoxes'), extractedCount = el('extractedCount');
-  let extractedEmpty = el('extractedEmpty');
-  const nodeGraph = el('nodeGraph'), legendEl = el('legend');
-  const extrapolationBody = el('extrapolationBody');
-  let extrapolationEmpty = el('extrapolationEmpty');
+  const siteInput = el('siteInput');
+  const statusText = el('statusText');
 
-  const CATEGORY_ORDER = ['financial_aid_overview','scholarships','amounts','deadlines','how_to_apply','notes'];
-  const CATEGORY_LABELS = {
-    financial_aid_overview: 'Aid overview', scholarships: 'Scholarships', amounts: 'Amounts',
-    deadlines: 'Deadlines', how_to_apply: 'How to apply', notes: 'Notes'
-  };
-  const CATEGORY_COLORS = {
-    financial_aid_overview: '#2563eb', scholarships: '#7c3aed', amounts: '#059669',
-    deadlines: '#dc2626', how_to_apply: '#d97706', notes: '#64748b'
-  };
-  const CONTEXT_COLORS = { bullet: '#1d4ed8', heading: '#b35c00', paragraph: '#5c5c5c' };
-  const CONTEXT_LABELS = { bullet: 'bullet point', heading: 'heading', paragraph: 'paragraph' };
-
-  let latencyPoints = [];
-  let progressPoints = [];
-  let hitMissPoints = [];        // parallel to progressPoints: true = sentence yielded a fact
-  let sentenceHistory = [];      // {index, context, contributedKeys, chunkPreview, text}
-  let extractionRecords = [];    // {key, context, url, sentences[], items[], firstIndex, lastIndex}
-  let candidateUrl = '';
-  const MAX_VISIBLE_NODES = 9;
-
-  function buildLegend(){
-    let parts = [];
-    Object.keys(CONTEXT_COLORS).forEach(k => {
-      parts.push('<span class="item"><span class="dot" style="background:' + CONTEXT_COLORS[k] + '"></span>' + CONTEXT_LABELS[k] + '</span>');
-    });
-    CATEGORY_ORDER.forEach(k => {
-      parts.push('<span class="item"><span class="dot" style="background:' + CATEGORY_COLORS[k] + '"></span>' + CATEGORY_LABELS[k] + '</span>');
-    });
-    legendEl.innerHTML = parts.join('');
+  // ============================= SHARED ==================================
+  function svgEsc(s){
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
   }
-  buildLegend();
-
-  function logRow(text){
-    [logEl, logTableEl].forEach(function(target){
-      const row = document.createElement('div');
-      row.className = 'row';
-      row.textContent = text;
-      target.appendChild(row);
-      target.scrollTop = target.scrollHeight;
-    });
+  function logRowInto(target, text){
+    const row = document.createElement('div');
+    row.className = 'row';
+    row.textContent = text;
+    target.appendChild(row);
+    target.scrollTop = target.scrollHeight;
   }
-
-  function setBanner(kind, text){
-    if (!text){ banner.innerHTML = ''; return; }
-    banner.innerHTML = '<div class="msg-' + kind + '">' + text + '</div>';
+  function setBannerInto(target, kind, text){
+    if (!text){ target.innerHTML = ''; return; }
+    target.innerHTML = '<div class="msg-' + kind + '">' + text + '</div>';
   }
-
   function contextKind(context){
     if (!context) return 'paragraph';
     if (context.indexOf('bullet') === 0) return 'bullet';
     if (context === 'heading') return 'heading';
     return 'paragraph';
   }
-
-  function pillClass(context){ return contextKind(context); }
-
   function drawLine(canvas, values, color){
     const ctx = canvas.getContext('2d');
     const w = canvas.width, h = canvas.height;
@@ -837,8 +1093,7 @@ INDEX_HTML = """<!DOCTYPE html>
     ctx.fillStyle = color;
     ctx.beginPath(); ctx.arc(w-2,lastY,3,0,Math.PI*2); ctx.fill();
   }
-
-  function drawProgressWithHits(canvas, values, hits, color){
+  function drawProgressWithHits(canvas, values, hits, color, hitColor){
     const ctx = canvas.getContext('2d');
     const w = canvas.width, h = canvas.height;
     ctx.clearRect(0,0,w,h);
@@ -847,12 +1102,11 @@ INDEX_HTML = """<!DOCTYPE html>
       const y = h - (h*i/4);
       ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(w,y); ctx.stroke();
     }
-    // hit/miss strip along the bottom: green = useful info found, grey = just another sentence
     if (hits.length){
       const bw = w / hits.length;
       hits.forEach((hit, i) => {
         ctx.globalAlpha = hit ? 0.9 : 0.55;
-        ctx.fillStyle = hit ? '#1a7f37' : '#d4d4d4';
+        ctx.fillStyle = hit ? hitColor : '#d4d4d4';
         ctx.fillRect(i*bw, h-9, Math.max(bw-1,1), 9);
       });
       ctx.globalAlpha = 1;
@@ -872,220 +1126,22 @@ INDEX_HTML = """<!DOCTYPE html>
     ctx.beginPath(); ctx.arc(w-2,lastY,3,0,Math.PI*2); ctx.fill();
   }
 
-  function redrawCharts(){
-    drawLine(latencyCanvas, latencyPoints, '#1a1a1a');
-    drawProgressWithHits(progressCanvas, progressPoints, hitMissPoints, '#1d4ed8');
-  }
+  const modelSelects = [el('snipeModelSelect'), el('filterModelSelect')].filter(Boolean);
+  let modelsPopulated = false;
 
-  function computeContributedKeys(delta){
-    if (!delta) return [];
-    return Object.keys(delta).filter(k => {
-      const v = delta[k];
-      if (Array.isArray(v)) return v.length > 0;
-      if (typeof v === 'string') return v.trim().length > 0;
-      return !!v;
-    }).filter(k => CATEGORY_COLORS[k]);
-  }
-
-  function svgEsc(s){
-    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-  }
-
-  function buildChunkPreview(delta){
-    const keys = computeContributedKeys(delta);
-    if (!keys.length) return null;
-    const k = keys[0];
-    let v = delta[k];
-    let first = Array.isArray(v) ? v[0] : v;
-    let full = typeof first === 'string' ? first : JSON.stringify(first);
-    full = (full || '').trim() || '(added)';
-    const text = full.length > 40 ? full.slice(0, 37) + '…' : full;
-    return { key: k, text: text, full: full };
-  }
-
-  function addExtractedBox(index, chunk){
-    if (extractedEmpty){ extractedEmpty.remove(); extractedEmpty = null; }
-    const color = CATEGORY_COLORS[chunk.key] || '#191919';
-    const box = document.createElement('div');
-    box.className = 'extracted-box';
-    box.style.borderColor = color;
-    box.title = (CATEGORY_LABELS[chunk.key] || chunk.key) + ': ' + chunk.full;
-    box.innerHTML =
-      '<div class="exb-head" style="color:' + color + '">' + svgEsc(CATEGORY_LABELS[chunk.key] || chunk.key) +
-      '<span class="exb-idx">S' + (index+1) + '</span></div>' +
-      '<div class="exb-text">' + svgEsc(chunk.text) + '</div>';
-    extractedBoxes.appendChild(box);
-    extractedCount.textContent = '(' + extractedBoxes.children.length + ')';
-    extractedBoxes.scrollTop = extractedBoxes.scrollHeight;
-  }
-
-  // -- Data extrapolation table: which sentence(s) fed which extracted fact --
-  function updateExtractionRecords(entry, delta){
-    const keys = computeContributedKeys(delta);
-    if (!keys.length) return;
-    const primaryKey = keys[0];
-    const items = [];
-    keys.forEach(k => {
-      const v = delta[k];
-      const arr = Array.isArray(v) ? v : [v];
-      arr.forEach(item => {
-        const text = typeof item === 'string' ? item : JSON.stringify(item);
-        if (text && text.trim()) items.push({ key: k, text: text.trim() });
+  function populateModelSelects(models, defaultModel){
+    if (modelsPopulated) return;
+    const opts = (models && models.length) ? models : [defaultModel];
+    modelSelects.forEach(sel => {
+      sel.innerHTML = '';
+      opts.forEach(name => {
+        const o = document.createElement('option');
+        o.value = name; o.textContent = name;
+        if (name === defaultModel) o.selected = true;
+        sel.appendChild(o);
       });
     });
-
-    const last = extractionRecords[extractionRecords.length - 1];
-    // consecutive sentences landing in the same category get merged into one
-    // row -- that's the "took 3 sentences to get one piece of info" case.
-    if (last && last.key === primaryKey && entry.index === last.lastIndex + 1){
-      last.sentences.push(entry.text || '(sentence ' + (entry.index+1) + ')');
-      last.items = last.items.concat(items);
-      last.lastIndex = entry.index;
-    } else {
-      extractionRecords.push({
-        key: primaryKey,
-        context: entry.context,
-        url: candidateUrl,
-        sentences: [entry.text || '(sentence ' + (entry.index+1) + ')'],
-        items: items,
-        firstIndex: entry.index,
-        lastIndex: entry.index,
-      });
-    }
-    renderExtrapolationTable();
-  }
-
-  function renderExtrapolationTable(){
-    if (!extractionRecords.length){
-      extrapolationBody.innerHTML = '<tr><td colspan="3" class="empty" id="extrapolationEmpty">Nothing extrapolated yet.</td></tr>';
-      extrapolationEmpty = el('extrapolationEmpty');
-      return;
-    }
-    if (extrapolationEmpty){ extrapolationEmpty = null; }
-
-    const rows = extractionRecords.map(rec => {
-      const catColor = CATEGORY_COLORS[rec.key] || '#191919';
-      const ctxKind = contextKind(rec.context);
-      const ctxColor = CONTEXT_COLORS[ctxKind] || '#5c5c5c';
-      const label = rec.sentences.length > 1
-        ? 'S' + (rec.firstIndex+1) + '–S' + (rec.lastIndex+1) + ' (' + rec.sentences.length + ' sentences)'
-        : 'S' + (rec.firstIndex+1);
-
-      const col1 = '<div style="font-size:10.5px;color:var(--muted);margin-bottom:4px;">' + svgEsc(label) + '</div>' +
-        svgEsc(rec.sentences.join(' '));
-
-      const col2 =
-        '<span class="extrap-pill" style="background:' + ctxColor + '19;color:' + ctxColor + ';border:1px solid ' + ctxColor + '55;">prompt: ' + svgEsc(CONTEXT_LABELS[ctxKind] || ctxKind) + ' sentence</span>' +
-        '<span class="extrap-pill" style="background:' + catColor + '19;color:' + catColor + ';border:1px solid ' + catColor + '55;">tag: ' + svgEsc(CATEGORY_LABELS[rec.key] || rec.key) + '</span>' +
-        (rec.url ? '<span class="extrap-url">' + svgEsc(rec.url) + '</span>' : '');
-
-      const uniqueItems = [];
-      const seen = new Set();
-      rec.items.forEach(it => { if (!seen.has(it.text)){ seen.add(it.text); uniqueItems.push(it); } });
-      const col3 = '<ul class="extrap-list">' + uniqueItems.map(it =>
-        '<li><span class="extrap-icon" style="color:' + (CATEGORY_COLORS[it.key] || '#191919') + ';">&rsaquo;</span><span class="extrap-item-text">' + svgEsc(it.text) + '</span></li>'
-      ).join('') + '</ul>';
-
-      return '<tr><td>' + col1 + '</td><td>' + col2 + '</td><td>' + col3 + '</td></tr>';
-    });
-
-    extrapolationBody.innerHTML = rows.join('');
-  }
-
-  function renderGraph(){
-    const W = 640, H = 520;
-    const catX = W - 128;
-    const catGap = H / (CATEGORY_ORDER.length + 1);
-    const catPos = {};
-    CATEGORY_ORDER.forEach((cat, i) => { catPos[cat] = { x: catX, y: catGap * (i+1) }; });
-
-    const visible = sentenceHistory.slice(-MAX_VISIBLE_NODES);
-    const sentX = 156;
-    const sentGap = H / (MAX_VISIBLE_NODES + 1);
-    const chunkX = 16;
-    const chunkW = 116;
-
-    let parts = [];
-
-    // wires: extracted-data chunk box -> the sentence node that produced it (new)
-    visible.forEach((s, i) => {
-      if (!s.chunkPreview) return;
-      const sy = sentGap * (i+1);
-      const x1 = chunkX + chunkW, y1 = sy, x2 = sentX, y2 = sy;
-      const mx = (x1+x2)/2;
-      const d = 'M ' + x1 + ' ' + y1 + ' C ' + mx + ' ' + y1 + ', ' + mx + ' ' + y2 + ', ' + x2 + ' ' + y2;
-      const color = CATEGORY_COLORS[s.chunkPreview.key] || '#999';
-      parts.push('<path d="' + d + '" fill="none" stroke="' + color + '" stroke-width="1.4" opacity="0.45"/>');
-    });
-
-    // wires (drawn first, under the nodes) -- sentence -> category, kept as-is
-    visible.forEach((s, i) => {
-      const sy = sentGap * (i+1);
-      (s.contributedKeys || []).forEach(key => {
-        const cp = catPos[key];
-        if (!cp) return;
-        const x1 = sentX + 92, y1 = sy, x2 = cp.x, y2 = cp.y;
-        const mx = (x1+x2)/2;
-        const d = 'M ' + x1 + ' ' + y1 + ' C ' + mx + ' ' + y1 + ', ' + mx + ' ' + y2 + ', ' + x2 + ' ' + y2;
-        parts.push('<path d="' + d + '" fill="none" stroke="' + CATEGORY_COLORS[key] + '" stroke-width="1.6" opacity="0.55"/>');
-      });
-    });
-
-    // category nodes (right side)
-    CATEGORY_ORDER.forEach(cat => {
-      const p = catPos[cat], color = CATEGORY_COLORS[cat];
-      parts.push(
-        '<rect x="' + p.x + '" y="' + (p.y-14) + '" width="118" height="28" rx="8" fill="#ffffff" stroke="' + color + '" stroke-width="1.6"/>' +
-        '<circle cx="' + p.x + '" cy="' + p.y + '" r="4" fill="' + color + '"/>' +
-        '<text x="' + (p.x+12) + '" y="' + (p.y+4) + '" font-size="11" fill="' + color + '">' + svgEsc(CATEGORY_LABELS[cat]) + '</text>'
-      );
-    });
-
-    // sentence nodes (left side)
-    visible.forEach((s, i) => {
-      const sy = sentGap * (i+1);
-      const kind = contextKind(s.context);
-      const color = CONTEXT_COLORS[kind];
-      const hasDelta = (s.contributedKeys || []).length > 0;
-      parts.push(
-        '<circle cx="' + (sentX+92) + '" cy="' + sy + '" r="4" fill="' + color + '"/>' +
-        '<rect x="' + sentX + '" y="' + (sy-14) + '" width="92" height="28" rx="8" fill="#ffffff" stroke="' + color +
-          '" stroke-width="' + (hasDelta ? 1.8 : 1) + '" opacity="' + (hasDelta ? 1 : 0.55) + '"/>' +
-        '<text x="' + (sentX+8) + '" y="' + (sy+4) + '" font-size="10" fill="' + color + '">S' + (s.index+1) + ' · ' + svgEsc(kind) + '</text>'
-      );
-    });
-
-    // extracted-data chunk nodes (far left, new) -- only sentences that hit
-    // text is clipped to the box, full content shown via native tooltip on hover
-    visible.forEach((s, i) => {
-      if (!s.chunkPreview) return;
-      const sy = sentGap * (i+1);
-      const color = CATEGORY_COLORS[s.chunkPreview.key] || '#999';
-      const clipId = 'clip-chunk-' + s.index;
-      const tooltip = (CATEGORY_LABELS[s.chunkPreview.key] || '') + ': ' + s.chunkPreview.full;
-      parts.push(
-        '<clipPath id="' + clipId + '"><rect x="' + (chunkX+6) + '" y="' + (sy-13) + '" width="' + (chunkW-12) + '" height="26"/></clipPath>' +
-        '<g>' +
-          '<title>' + svgEsc(tooltip) + '</title>' +
-          '<rect x="' + chunkX + '" y="' + (sy-15) + '" width="' + chunkW + '" height="30" rx="8" fill="#fbfbfb" stroke="' + color + '" stroke-width="1.4"/>' +
-          '<text clip-path="url(#' + clipId + ')" x="' + (chunkX+8) + '" y="' + (sy-2) + '" font-size="8.5" fill="' + color + '" font-weight="700">' + svgEsc(CATEGORY_LABELS[s.chunkPreview.key] || '') + '</text>' +
-          '<text clip-path="url(#' + clipId + ')" x="' + (chunkX+8) + '" y="' + (sy+9) + '" font-size="8.5" fill="#555">' + svgEsc(s.chunkPreview.text) + '</text>' +
-        '</g>'
-      );
-    });
-
-    nodeGraph.innerHTML = parts.join('');
-  }
-
-  function renderKnowledgeHTML(knowledge){
-    let text = JSON.stringify(knowledge, null, 2);
-    text = svgEsc(text);
-    CATEGORY_ORDER.forEach(key => {
-      const color = CATEGORY_COLORS[key];
-      text = text.replace(new RegExp('"' + key + '"', 'g'),
-        '<span style="color:' + color + ';font-weight:600;">"' + key + '"</span>');
-    });
-    return text;
+    modelsPopulated = true;
   }
 
   async function pollStatus(){
@@ -1095,6 +1151,7 @@ INDEX_HTML = """<!DOCTYPE html>
       statusText.textContent = d.connected
         ? ('connected · model ' + d.model + (d.models && d.models.length ? ' · ' + d.models.length + ' model(s) on host' : ''))
         : ('Ollama unreachable — ' + (d.error || 'unknown error'));
+      if (d.model) populateModelSelects(d.models, d.model);
     }catch(e){
       statusText.textContent = 'status check failed';
     }
@@ -1102,150 +1159,560 @@ INDEX_HTML = """<!DOCTYPE html>
   pollStatus();
   setInterval(pollStatus, 8000);
 
-  function resetPanels(){
-    setBanner(null, '');
-    crawlBody.textContent = 'Crawling…';
-    crawlBody.classList.remove('empty');
-    linksSample.textContent = '';
-    contextPill.innerHTML = '';
-    sentenceText.textContent = '—';
-    sentenceText.classList.add('empty');
-    sentenceMeta.textContent = '';
-    progressBar.value = 0; progressBar.max = 1;
-    promptView.textContent = '—';
-    promptView.classList.add('empty');
-    knowledgeView.textContent = '{}';
-    logEl.innerHTML = ''; logTableEl.innerHTML = '';
-    latencyPoints = []; progressPoints = []; hitMissPoints = []; sentenceHistory = [];
-    extractionRecords = []; candidateUrl = '';
-    extractedBoxes.innerHTML = '<div class="empty" id="extractedEmpty">Nothing extracted yet — a box appears here every time a sentence yields a useful fact.</div>';
-    extractedEmpty = el('extractedEmpty');
-    extractedCount.textContent = '';
-    extrapolationBody.innerHTML = '<tr><td colspan="3" class="empty" id="extrapolationEmpty">Nothing extrapolated yet.</td></tr>';
-    extrapolationEmpty = el('extrapolationEmpty');
-    redrawCharts(); renderGraph();
-  }
-
-  startBtn.addEventListener('click', async () => {
+  async function startSection(section, startBtn, stopBtn, resetFn, modelSelect){
     const site = siteInput.value.trim();
     if (!site){ alert('Enter a site first, e.g. princeton.edu'); return; }
-    resetPanels();
+    resetFn();
     startBtn.disabled = true; stopBtn.disabled = false;
     try{
-      const r = await fetch('/api/start', {
+      const r = await fetch('/api/' + section + '/start', {
         method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({site: site})
+        body: JSON.stringify({site: site, model: modelSelect ? modelSelect.value : undefined})
       });
       if (!r.ok){
         const d = await r.json().catch(()=>({}));
-        setBanner('error', 'Could not start: ' + (d.error || r.status));
         startBtn.disabled = false; stopBtn.disabled = true;
+        return d.error || ('status ' + r.status);
       }
     }catch(e){
-      setBanner('error', 'Could not start: ' + e.message);
       startBtn.disabled = false; stopBtn.disabled = true;
+      return e.message;
     }
-  });
-
-  stopBtn.addEventListener('click', async () => {
+    return null;
+  }
+  async function stopSection(section, stopBtn){
     stopBtn.disabled = true;
-    await fetch('/api/stop', {method:'POST'});
-  });
+    await fetch('/api/' + section + '/stop', {method:'POST'});
+  }
 
+  // ============================= SNIPE ====================================
+  (function(){
+    const CAT_LABEL = {aid: 'financial aid / scholarship / grant', amount: 'amount stated', both: 'aid + amount'};
+    const startBtn = el('snipeStartBtn'), stopBtn = el('snipeStopBtn');
+    const banner = el('snipeBanner');
+    const crawlBody = el('snipeCrawlBody'), linksSample = el('snipeLinksSample');
+    const paraPill = el('paraPill'), paraText = el('paraText'), paraMeta = el('paraMeta');
+    const progressBar = el('snipeProgressBar'), reasonBox = el('snipeReasonBox');
+    const hitList = el('snipeHitList'), hitCount = el('snipeHitCount');
+    let hitEmpty = el('snipeHitEmpty');
+    const logEl = el('snipeLog');
+
+    let currentParaText = '';
+    let currentHighlights = []; // [{start,end,category}], filled in as sentences are checked
+
+    function reset(){
+      setBannerInto(banner, null, '');
+      crawlBody.textContent = 'Crawling…'; crawlBody.classList.remove('empty');
+      linksSample.textContent = '';
+      paraPill.innerHTML = '';
+      paraText.textContent = '—'; paraText.classList.add('empty');
+      paraMeta.textContent = '';
+      progressBar.value = 0; progressBar.max = 1;
+      reasonBox.innerHTML = '<span class="empty">The sentence being checked, and the model\\'s reason, appear here as it works through the paragraph.</span>';
+      currentParaText = ''; currentHighlights = [];
+      logEl.innerHTML = '';
+      hitList.innerHTML = '<div class="empty" id="snipeHitEmpty">Nothing found yet — a card appears here every time a sentence comes back true for aid or amount.</div>';
+      hitEmpty = el('snipeHitEmpty');
+      hitCount.textContent = '';
+    }
+
+    function addHitCard(index, context, sentence, category){
+      if (hitEmpty){ hitEmpty.remove(); hitEmpty = null; }
+      const cat = CAT_LABEL[category] ? category : 'aid';
+      const card = document.createElement('div');
+      card.className = 'snipe-hit-card cat-' + cat;
+      card.innerHTML =
+        '<div class="shc-head"><span>' + svgEsc(context) + ' · ' + svgEsc(CAT_LABEL[cat]) + '</span><span>P' + (index+1) + '</span></div>' +
+        '<div class="shc-text">' + svgEsc(sentence) + '</div>';
+      hitList.appendChild(card);
+      hitCount.textContent = '(' + hitList.querySelectorAll('.snipe-hit-card').length + ')';
+      hitList.scrollTop = hitList.scrollHeight;
+    }
+
+    function renderParagraph(){
+      const spans = currentHighlights.slice().sort((a,b) => a.start - b.start);
+      let out = '', pos = 0;
+      spans.forEach(sp => {
+        if (sp.start > pos) out += svgEsc(currentParaText.slice(pos, sp.start));
+        out += '<mark class="snipe-hit cat-' + sp.category + '">' + svgEsc(currentParaText.slice(sp.start, sp.end)) + '</mark>';
+        pos = sp.end;
+      });
+      if (pos < currentParaText.length) out += svgEsc(currentParaText.slice(pos));
+      paraText.innerHTML = out;
+      paraText.classList.remove('empty');
+    }
+
+    function renderReason(sentence, financial_aid, amount_mentioned, reason){
+      const flag = (on, label) => '<span class="' + (on ? 'rb-flag-on' : 'rb-flag-off') + '">' + label + ': ' + (on ? 'true' : 'false') + '</span>';
+      reasonBox.innerHTML =
+        '<span class="rb-sentence">' + svgEsc(sentence) + '</span>' +
+        '<span class="rb-flags">' + flag(financial_aid, 'financial aid') + flag(amount_mentioned, 'amount') + '</span>' +
+        svgEsc(reason || '(no reason given)');
+    }
+
+    startBtn.addEventListener('click', async () => {
+      const err = await startSection('snipe', startBtn, stopBtn, reset, el('snipeModelSelect'));
+      if (err) setBannerInto(banner, 'error', 'Could not start: ' + err);
+    });
+    stopBtn.addEventListener('click', () => stopSection('snipe', stopBtn));
+
+    window.__handleSnipeEvent = function(evt){
+      switch(evt.event){
+        case 'crawl_start':
+          logRowInto(logEl, '[' + evt.ts + '] crawling ' + evt.site);
+          break;
+        case 'retry':
+          setBannerInto(banner, 'error', 'network hiccup on ' + evt.what + ' — retrying (attempt ' + evt.attempt + '/' + evt.max_retries + ' failed: ' + evt.message + '), waiting ' + evt.wait + 's…');
+          logRowInto(logEl, '[' + evt.ts + '] retry — ' + evt.what + ' failed (' + evt.message + '), attempt ' + evt.attempt + '/' + evt.max_retries + ', waiting ' + evt.wait + 's');
+          break;
+        case 'crawl_done':
+          crawlBody.textContent = evt.link_count + ' link(s) found on the homepage.';
+          linksSample.textContent = (evt.sample || []).join('\\n');
+          logRowInto(logEl, '[' + evt.ts + '] crawl done — ' + evt.link_count + ' link(s)');
+          break;
+        case 'triage_fallback':
+          logRowInto(logEl, '[' + evt.ts + '] ' + evt.message);
+          break;
+        case 'candidate_found':
+          crawlBody.textContent = 'Candidate financial-aid page: ' + evt.url;
+          logRowInto(logEl, '[' + evt.ts + '] candidate page -> ' + evt.url);
+          break;
+        case 'page_extracted':
+          crawlBody.textContent = 'Extracted ' + evt.item_count + ' paragraph(s) from ' + evt.url;
+          progressBar.max = evt.item_count || 1;
+          logRowInto(logEl, '[' + evt.ts + '] page walked -> ' + evt.item_count + ' paragraph(s)');
+          break;
+        case 'para_start': {
+          const cls = contextKind(evt.context);
+          paraPill.innerHTML = '<span class="pill ' + cls + '">' + svgEsc(evt.context) + '</span>';
+          currentParaText = evt.text || '';
+          currentHighlights = [];
+          paraText.textContent = evt.text; paraText.classList.remove('empty');
+          paraMeta.textContent = 'paragraph ' + (evt.index+1) + ' / ' + evt.total + ' — splitting into sentences…';
+          break;
+        }
+        case 'sentence_check_start':
+          paraMeta.textContent = 'paragraph ' + (evt.index+1) + ' / ' + evt.total +
+            ' — checking sentence ' + (evt.sent_index+1) + ' / ' + evt.sent_total + '…';
+          break;
+        case 'sentence_check_done': {
+          const cat = evt.category;
+          if (cat) currentHighlights.push({start: evt.start, end: evt.end, category: cat});
+          renderParagraph();
+          renderReason(evt.sentence, evt.financial_aid, evt.amount_mentioned, evt.reason);
+          paraMeta.textContent = 'paragraph ' + (evt.index+1) + ' / ' + evt.total +
+            ' — sentence ' + (evt.sent_index+1) + ' / ' + evt.sent_total + ' (' + evt.elapsed + 's)' +
+            (cat ? ' — matched: ' + CAT_LABEL[cat] : ' — no match');
+          if (cat){
+            addHitCard(evt.index, evt.context || '', evt.sentence, cat);
+          }
+          break;
+        }
+        case 'para_done': {
+          progressBar.value = evt.index + 1;
+          paraMeta.textContent = 'paragraph ' + (evt.index+1) + ' / ' + evt.total + ' done' +
+            (evt.hit ? (' — ' + evt.hit_count + ' matching sentence(s) in this paragraph') : ' — nothing relevant in this one');
+          break;
+        }
+        case 'run_done':
+          setBannerInto(banner, 'good', evt.stopped_early ? 'Stopped early — ' + (evt.hits||[]).length + ' sentence(s) found so far.'
+                                                            : 'Done — ' + (evt.hits||[]).length + ' sentence(s) found.');
+          logRowInto(logEl, '[' + evt.ts + '] run finished' + (evt.stopped_early ? ' (stopped early)' : ''));
+          startBtn.disabled = false; stopBtn.disabled = true;
+          break;
+        case 'stopped':
+          logRowInto(logEl, '[' + evt.ts + '] stopped by user');
+          startBtn.disabled = false; stopBtn.disabled = true;
+          break;
+        case 'error':
+          setBannerInto(banner, 'error', evt.message);
+          logRowInto(logEl, '[' + evt.ts + '] ERROR: ' + evt.message);
+          startBtn.disabled = false; stopBtn.disabled = true;
+          break;
+      }
+    };
+  })();
+
+  // ============================= FILTER PASS ==============================
+  (function(){
+    const startBtn = el('filterStartBtn'), stopBtn = el('filterStopBtn');
+    const banner = el('filterBanner');
+    const crawlBody = el('crawlBody'), linksSample = el('linksSample');
+    const contextPill = el('contextPill'), sentenceText = el('sentenceText'), sentenceMeta = el('sentenceMeta');
+    const progressBar = el('progressBar'), knowledgeView = el('knowledgeView'), logEl = el('log');
+    const logTableEl = el('logTable'), promptView = el('promptView');
+    const latencyCanvas = el('latencyChart'), progressCanvas = el('progressChart');
+    const extractedBoxes = el('extractedBoxes'), extractedCount = el('extractedCount');
+    let extractedEmpty = el('extractedEmpty');
+    const nodeGraph = el('nodeGraph'), legendEl = el('legend');
+    const extrapolationBody = el('extrapolationBody');
+    let extrapolationEmpty = el('extrapolationEmpty');
+
+    const CATEGORY_ORDER = ['financial_aid_overview','scholarships','amounts','deadlines','how_to_apply','notes'];
+    const CATEGORY_LABELS = {
+      financial_aid_overview: 'Aid overview', scholarships: 'Scholarships', amounts: 'Amounts',
+      deadlines: 'Deadlines', how_to_apply: 'How to apply', notes: 'Notes'
+    };
+    const CATEGORY_COLORS = {
+      financial_aid_overview: '#2563eb', scholarships: '#7c3aed', amounts: '#059669',
+      deadlines: '#dc2626', how_to_apply: '#d97706', notes: '#64748b'
+    };
+    const CONTEXT_COLORS = { bullet: '#1d4ed8', heading: '#b35c00', paragraph: '#5c5c5c' };
+    const CONTEXT_LABELS = { bullet: 'bullet point', heading: 'heading', paragraph: 'paragraph' };
+
+    let latencyPoints = [];
+    let progressPoints = [];
+    let hitMissPoints = [];
+    let sentenceHistory = [];
+    let extractionRecords = [];
+    let candidateUrl = '';
+    const MAX_VISIBLE_NODES = 9;
+
+    function buildLegend(){
+      let parts = [];
+      Object.keys(CONTEXT_COLORS).forEach(k => {
+        parts.push('<span class="item"><span class="dot" style="background:' + CONTEXT_COLORS[k] + '"></span>' + CONTEXT_LABELS[k] + '</span>');
+      });
+      CATEGORY_ORDER.forEach(k => {
+        parts.push('<span class="item"><span class="dot" style="background:' + CATEGORY_COLORS[k] + '"></span>' + CATEGORY_LABELS[k] + '</span>');
+      });
+      legendEl.innerHTML = parts.join('');
+    }
+    buildLegend();
+
+    function logRow(text){
+      [logEl, logTableEl].forEach(function(target){ logRowInto(target, text); });
+    }
+
+    function pillClass(context){ return contextKind(context); }
+
+    function redrawCharts(){
+      drawLine(latencyCanvas, latencyPoints, '#1a1a1a');
+      drawProgressWithHits(progressCanvas, progressPoints, hitMissPoints, '#1d4ed8', '#1a7f37');
+    }
+
+    function computeContributedKeys(delta){
+      if (!delta) return [];
+      return Object.keys(delta).filter(k => {
+        const v = delta[k];
+        if (Array.isArray(v)) return v.length > 0;
+        if (typeof v === 'string') return v.trim().length > 0;
+        return !!v;
+      }).filter(k => CATEGORY_COLORS[k]);
+    }
+
+    function buildChunkPreview(delta){
+      const keys = computeContributedKeys(delta);
+      if (!keys.length) return null;
+      const k = keys[0];
+      let v = delta[k];
+      let first = Array.isArray(v) ? v[0] : v;
+      let full = typeof first === 'string' ? first : JSON.stringify(first);
+      full = (full || '').trim() || '(added)';
+      const text = full.length > 40 ? full.slice(0, 37) + '…' : full;
+      return { key: k, text: text, full: full };
+    }
+
+    function addExtractedBox(index, chunk){
+      if (extractedEmpty){ extractedEmpty.remove(); extractedEmpty = null; }
+      const color = CATEGORY_COLORS[chunk.key] || '#191919';
+      const box = document.createElement('div');
+      box.className = 'extracted-box';
+      box.style.borderColor = color;
+      box.title = (CATEGORY_LABELS[chunk.key] || chunk.key) + ': ' + chunk.full;
+      box.innerHTML =
+        '<div class="exb-head" style="color:' + color + '">' + svgEsc(CATEGORY_LABELS[chunk.key] || chunk.key) +
+        '<span class="exb-idx">S' + (index+1) + '</span></div>' +
+        '<div class="exb-text">' + svgEsc(chunk.text) + '</div>';
+      extractedBoxes.appendChild(box);
+      extractedCount.textContent = '(' + extractedBoxes.children.length + ')';
+      extractedBoxes.scrollTop = extractedBoxes.scrollHeight;
+    }
+
+    function updateExtractionRecords(entry, delta){
+      const keys = computeContributedKeys(delta);
+      if (!keys.length) return;
+      const primaryKey = keys[0];
+      const items = [];
+      keys.forEach(k => {
+        const v = delta[k];
+        const arr = Array.isArray(v) ? v : [v];
+        arr.forEach(item => {
+          const text = typeof item === 'string' ? item : JSON.stringify(item);
+          if (text && text.trim()) items.push({ key: k, text: text.trim() });
+        });
+      });
+
+      const last = extractionRecords[extractionRecords.length - 1];
+      if (last && last.key === primaryKey && entry.index === last.lastIndex + 1){
+        last.sentences.push(entry.text || '(sentence ' + (entry.index+1) + ')');
+        last.items = last.items.concat(items);
+        last.lastIndex = entry.index;
+      } else {
+        extractionRecords.push({
+          key: primaryKey,
+          context: entry.context,
+          url: candidateUrl,
+          sentences: [entry.text || '(sentence ' + (entry.index+1) + ')'],
+          items: items,
+          firstIndex: entry.index,
+          lastIndex: entry.index,
+        });
+      }
+      renderExtrapolationTable();
+    }
+
+    function renderExtrapolationTable(){
+      if (!extractionRecords.length){
+        extrapolationBody.innerHTML = '<tr><td colspan="3" class="empty" id="extrapolationEmpty">Nothing extrapolated yet.</td></tr>';
+        extrapolationEmpty = el('extrapolationEmpty');
+        return;
+      }
+      if (extrapolationEmpty){ extrapolationEmpty = null; }
+
+      const rows = extractionRecords.map(rec => {
+        const catColor = CATEGORY_COLORS[rec.key] || '#191919';
+        const ctxKind = contextKind(rec.context);
+        const ctxColor = CONTEXT_COLORS[ctxKind] || '#5c5c5c';
+        const label = rec.sentences.length > 1
+          ? 'S' + (rec.firstIndex+1) + '–S' + (rec.lastIndex+1) + ' (' + rec.sentences.length + ' sentences)'
+          : 'S' + (rec.firstIndex+1);
+
+        const col1 = '<div style="font-size:10.5px;color:var(--muted);margin-bottom:4px;">' + svgEsc(label) + '</div>' +
+          svgEsc(rec.sentences.join(' '));
+
+        const col2 =
+          '<span class="extrap-pill" style="background:' + ctxColor + '19;color:' + ctxColor + ';border:1px solid ' + ctxColor + '55;">prompt: ' + svgEsc(CONTEXT_LABELS[ctxKind] || ctxKind) + ' sentence</span>' +
+          '<span class="extrap-pill" style="background:' + catColor + '19;color:' + catColor + ';border:1px solid ' + catColor + '55;">tag: ' + svgEsc(CATEGORY_LABELS[rec.key] || rec.key) + '</span>' +
+          (rec.url ? '<span class="extrap-url">' + svgEsc(rec.url) + '</span>' : '');
+
+        const uniqueItems = [];
+        const seen = new Set();
+        rec.items.forEach(it => { if (!seen.has(it.text)){ seen.add(it.text); uniqueItems.push(it); } });
+        const col3 = '<ul class="extrap-list">' + uniqueItems.map(it =>
+          '<li><span class="extrap-icon" style="color:' + (CATEGORY_COLORS[it.key] || '#191919') + ';">&rsaquo;</span><span class="extrap-item-text">' + svgEsc(it.text) + '</span></li>'
+        ).join('') + '</ul>';
+
+        return '<tr><td>' + col1 + '</td><td>' + col2 + '</td><td>' + col3 + '</td></tr>';
+      });
+
+      extrapolationBody.innerHTML = rows.join('');
+    }
+
+    function renderGraph(){
+      const W = 640, H = 520;
+      const catX = W - 128;
+      const catGap = H / (CATEGORY_ORDER.length + 1);
+      const catPos = {};
+      CATEGORY_ORDER.forEach((cat, i) => { catPos[cat] = { x: catX, y: catGap * (i+1) }; });
+
+      const visible = sentenceHistory.slice(-MAX_VISIBLE_NODES);
+      const sentX = 156;
+      const sentGap = H / (MAX_VISIBLE_NODES + 1);
+      const chunkX = 16;
+      const chunkW = 116;
+
+      let parts = [];
+
+      visible.forEach((s, i) => {
+        if (!s.chunkPreview) return;
+        const sy = sentGap * (i+1);
+        const x1 = chunkX + chunkW, y1 = sy, x2 = sentX, y2 = sy;
+        const mx = (x1+x2)/2;
+        const d = 'M ' + x1 + ' ' + y1 + ' C ' + mx + ' ' + y1 + ', ' + mx + ' ' + y2 + ', ' + x2 + ' ' + y2;
+        const color = CATEGORY_COLORS[s.chunkPreview.key] || '#999';
+        parts.push('<path d="' + d + '" fill="none" stroke="' + color + '" stroke-width="1.4" opacity="0.45"/>');
+      });
+
+      visible.forEach((s, i) => {
+        const sy = sentGap * (i+1);
+        (s.contributedKeys || []).forEach(key => {
+          const cp = catPos[key];
+          if (!cp) return;
+          const x1 = sentX + 92, y1 = sy, x2 = cp.x, y2 = cp.y;
+          const mx = (x1+x2)/2;
+          const d = 'M ' + x1 + ' ' + y1 + ' C ' + mx + ' ' + y1 + ', ' + mx + ' ' + y2 + ', ' + x2 + ' ' + y2;
+          parts.push('<path d="' + d + '" fill="none" stroke="' + CATEGORY_COLORS[key] + '" stroke-width="1.6" opacity="0.55"/>');
+        });
+      });
+
+      CATEGORY_ORDER.forEach(cat => {
+        const p = catPos[cat], color = CATEGORY_COLORS[cat];
+        parts.push(
+          '<rect x="' + p.x + '" y="' + (p.y-14) + '" width="118" height="28" rx="8" fill="#ffffff" stroke="' + color + '" stroke-width="1.6"/>' +
+          '<circle cx="' + p.x + '" cy="' + p.y + '" r="4" fill="' + color + '"/>' +
+          '<text x="' + (p.x+12) + '" y="' + (p.y+4) + '" font-size="11" fill="' + color + '">' + svgEsc(CATEGORY_LABELS[cat]) + '</text>'
+        );
+      });
+
+      visible.forEach((s, i) => {
+        const sy = sentGap * (i+1);
+        const kind = contextKind(s.context);
+        const color = CONTEXT_COLORS[kind];
+        const hasDelta = (s.contributedKeys || []).length > 0;
+        parts.push(
+          '<circle cx="' + (sentX+92) + '" cy="' + sy + '" r="4" fill="' + color + '"/>' +
+          '<rect x="' + sentX + '" y="' + (sy-14) + '" width="92" height="28" rx="8" fill="#ffffff" stroke="' + color +
+            '" stroke-width="' + (hasDelta ? 1.8 : 1) + '" opacity="' + (hasDelta ? 1 : 0.55) + '"/>' +
+          '<text x="' + (sentX+8) + '" y="' + (sy+4) + '" font-size="10" fill="' + color + '">S' + (s.index+1) + ' · ' + svgEsc(kind) + '</text>'
+        );
+      });
+
+      visible.forEach((s, i) => {
+        if (!s.chunkPreview) return;
+        const sy = sentGap * (i+1);
+        const color = CATEGORY_COLORS[s.chunkPreview.key] || '#999';
+        const clipId = 'clip-chunk-' + s.index;
+        const tooltip = (CATEGORY_LABELS[s.chunkPreview.key] || '') + ': ' + s.chunkPreview.full;
+        parts.push(
+          '<clipPath id="' + clipId + '"><rect x="' + (chunkX+6) + '" y="' + (sy-13) + '" width="' + (chunkW-12) + '" height="26"/></clipPath>' +
+          '<g>' +
+            '<title>' + svgEsc(tooltip) + '</title>' +
+            '<rect x="' + chunkX + '" y="' + (sy-15) + '" width="' + chunkW + '" height="30" rx="8" fill="#fbfbfb" stroke="' + color + '" stroke-width="1.4"/>' +
+            '<text clip-path="url(#' + clipId + ')" x="' + (chunkX+8) + '" y="' + (sy-2) + '" font-size="8.5" fill="' + color + '" font-weight="700">' + svgEsc(CATEGORY_LABELS[s.chunkPreview.key] || '') + '</text>' +
+            '<text clip-path="url(#' + clipId + ')" x="' + (chunkX+8) + '" y="' + (sy+9) + '" font-size="8.5" fill="#555">' + svgEsc(s.chunkPreview.text) + '</text>' +
+          '</g>'
+        );
+      });
+
+      nodeGraph.innerHTML = parts.join('');
+    }
+
+    function renderKnowledgeHTML(knowledge){
+      let text = JSON.stringify(knowledge, null, 2);
+      text = svgEsc(text);
+      CATEGORY_ORDER.forEach(key => {
+        const color = CATEGORY_COLORS[key];
+        text = text.replace(new RegExp('"' + key + '"', 'g'),
+          '<span style="color:' + color + ';font-weight:600;">"' + key + '"</span>');
+      });
+      return text;
+    }
+
+    function reset(){
+      setBannerInto(banner, null, '');
+      crawlBody.textContent = 'Crawling…'; crawlBody.classList.remove('empty');
+      linksSample.textContent = '';
+      contextPill.innerHTML = '';
+      sentenceText.textContent = '—'; sentenceText.classList.add('empty');
+      sentenceMeta.textContent = '';
+      progressBar.value = 0; progressBar.max = 1;
+      promptView.textContent = '—'; promptView.classList.add('empty');
+      knowledgeView.textContent = '{}';
+      logEl.innerHTML = ''; logTableEl.innerHTML = '';
+      latencyPoints = []; progressPoints = []; hitMissPoints = []; sentenceHistory = [];
+      extractionRecords = []; candidateUrl = '';
+      extractedBoxes.innerHTML = '<div class="empty" id="extractedEmpty">Nothing extracted yet — a box appears here every time a sentence yields a useful fact.</div>';
+      extractedEmpty = el('extractedEmpty');
+      extractedCount.textContent = '';
+      extrapolationBody.innerHTML = '<tr><td colspan="3" class="empty" id="extrapolationEmpty">Nothing extrapolated yet.</td></tr>';
+      extrapolationEmpty = el('extrapolationEmpty');
+      redrawCharts(); renderGraph();
+    }
+
+    startBtn.addEventListener('click', async () => {
+      const err = await startSection('filter', startBtn, stopBtn, reset, el('filterModelSelect'));
+      if (err) setBannerInto(banner, 'error', 'Could not start: ' + err);
+    });
+    stopBtn.addEventListener('click', () => stopSection('filter', stopBtn));
+
+    window.__handleFilterEvent = function(evt){
+      switch(evt.event){
+        case 'crawl_start':
+          logRow('[' + evt.ts + '] crawling ' + evt.site);
+          break;
+        case 'retry':
+          setBannerInto(banner, 'error', 'network hiccup on ' + evt.what + ' — retrying (attempt ' + evt.attempt + '/' + evt.max_retries + ' failed: ' + evt.message + '), waiting ' + evt.wait + 's…');
+          logRow('[' + evt.ts + '] retry — ' + evt.what + ' failed (' + evt.message + '), attempt ' + evt.attempt + '/' + evt.max_retries + ', waiting ' + evt.wait + 's');
+          break;
+        case 'crawl_done':
+          crawlBody.textContent = evt.link_count + ' link(s) found on the homepage.';
+          linksSample.textContent = (evt.sample || []).join('\\n');
+          logRow('[' + evt.ts + '] crawl done — ' + evt.link_count + ' link(s)');
+          break;
+        case 'triage_fallback':
+          logRow('[' + evt.ts + '] ' + evt.message);
+          break;
+        case 'candidate_found':
+          crawlBody.textContent = 'Candidate financial-aid page: ' + evt.url;
+          logRow('[' + evt.ts + '] candidate page -> ' + evt.url);
+          candidateUrl = evt.url;
+          break;
+        case 'page_extracted':
+          crawlBody.textContent = 'Extracted ' + evt.item_count + ' sentence(s) from ' + evt.url;
+          progressBar.max = evt.item_count || 1;
+          logRow('[' + evt.ts + '] page walked -> ' + evt.item_count + ' sentence(s)');
+          break;
+        case 'sentence_start': {
+          const cls = pillClass(evt.context);
+          contextPill.innerHTML = '<span class="pill ' + cls + '">' + svgEsc(evt.context) + '</span>';
+          sentenceText.textContent = evt.text;
+          sentenceText.classList.remove('empty');
+          sentenceMeta.textContent = 'sentence ' + (evt.index+1) + ' / ' + evt.total + ' — asking qwen…';
+          if (evt.prompt){
+            promptView.textContent = evt.prompt;
+            promptView.classList.remove('empty');
+          }
+          sentenceHistory.push({index: evt.index, context: evt.context, contributedKeys: [], text: evt.text, prompt: evt.prompt});
+          renderGraph();
+          break;
+        }
+        case 'sentence_done': {
+          sentenceMeta.textContent = 'sentence ' + (evt.index+1) + ' / ' + evt.total +
+            ' — ' + evt.elapsed + 's round-trip';
+          progressBar.value = evt.index + 1;
+          knowledgeView.innerHTML = renderKnowledgeHTML(evt.knowledge);
+          knowledgeView.classList.remove('empty');
+          latencyPoints.push(evt.elapsed);
+          progressPoints.push((evt.index+1) / evt.total);
+
+          const keys = computeContributedKeys(evt.delta);
+          let entry = sentenceHistory.find(s => s.index === evt.index);
+          if (!entry){ entry = {index: evt.index, context: evt.context}; sentenceHistory.push(entry); }
+          entry.contributedKeys = keys;
+          entry.chunkPreview = buildChunkPreview(evt.delta);
+
+          hitMissPoints.push(keys.length > 0);
+          redrawCharts();
+          renderGraph();
+
+          if (entry.chunkPreview){
+            addExtractedBox(evt.index, entry.chunkPreview);
+            updateExtractionRecords(entry, evt.delta);
+          }
+          break;
+        }
+        case 'run_done':
+          setBannerInto(banner, 'good', evt.stopped_early ? 'Stopped early — knowledge collected so far is shown above.'
+                                               : 'Done — knowledge JSON above is the full result.');
+          logRow('[' + evt.ts + '] run finished' + (evt.stopped_early ? ' (stopped early)' : ''));
+          startBtn.disabled = false; stopBtn.disabled = true;
+          break;
+        case 'stopped':
+          logRow('[' + evt.ts + '] stopped by user');
+          startBtn.disabled = false; stopBtn.disabled = true;
+          break;
+        case 'error':
+          setBannerInto(banner, 'error', evt.message);
+          logRow('[' + evt.ts + '] ERROR: ' + evt.message);
+          startBtn.disabled = false; stopBtn.disabled = true;
+          break;
+      }
+    };
+
+    redrawCharts();
+    renderGraph();
+  })();
+
+  // ============================= SHARED SSE DISPATCH =======================
   const es = new EventSource('/api/events');
   es.onmessage = (e) => {
     let evt;
     try{ evt = JSON.parse(e.data); } catch(err){ return; }
-    handleEvent(evt);
+    if (evt.section === 'snipe' && window.__handleSnipeEvent) window.__handleSnipeEvent(evt);
+    else if (evt.section === 'filter' && window.__handleFilterEvent) window.__handleFilterEvent(evt);
   };
   es.onerror = () => { /* browser auto-reconnects SSE */ };
-
-  function handleEvent(evt){
-    switch(evt.event){
-      case 'crawl_start': {
-        logRow('[' + evt.ts + '] crawling ' + evt.site);
-        break;
-      }
-      case 'retry':
-        setBanner('error', 'network hiccup on ' + evt.what + ' — retrying (attempt ' + evt.attempt + '/' + evt.max_retries + ' failed: ' + evt.message + '), waiting ' + evt.wait + 's…');
-        logRow('[' + evt.ts + '] retry — ' + evt.what + ' failed (' + evt.message + '), attempt ' + evt.attempt + '/' + evt.max_retries + ', waiting ' + evt.wait + 's');
-        break;
-      case 'crawl_done':
-        crawlBody.textContent = evt.link_count + ' link(s) found on the homepage.';
-        linksSample.textContent = (evt.sample || []).join('\\n');
-        logRow('[' + evt.ts + '] crawl done — ' + evt.link_count + ' link(s)');
-        break;
-      case 'triage_fallback':
-        logRow('[' + evt.ts + '] ' + evt.message);
-        break;
-      case 'candidate_found':
-        crawlBody.textContent = 'Candidate financial-aid page: ' + evt.url;
-        logRow('[' + evt.ts + '] candidate page -> ' + evt.url);
-        candidateUrl = evt.url;
-        break;
-      case 'page_extracted':
-        crawlBody.textContent = 'Extracted ' + evt.item_count + ' sentence(s) from ' + evt.url;
-        progressBar.max = evt.item_count || 1;
-        logRow('[' + evt.ts + '] page walked -> ' + evt.item_count + ' sentence(s)');
-        break;
-      case 'sentence_start': {
-        const cls = pillClass(evt.context);
-        contextPill.innerHTML = '<span class="pill ' + cls + '">' + evt.context + '</span>';
-        sentenceText.textContent = evt.text;
-        sentenceText.classList.remove('empty');
-        sentenceMeta.textContent = 'sentence ' + (evt.index+1) + ' / ' + evt.total + ' — asking qwen…';
-        if (evt.prompt){
-          promptView.textContent = evt.prompt;
-          promptView.classList.remove('empty');
-        }
-        sentenceHistory.push({index: evt.index, context: evt.context, contributedKeys: [], text: evt.text, prompt: evt.prompt});
-        renderGraph();
-        break;
-      }
-      case 'sentence_done': {
-        sentenceMeta.textContent = 'sentence ' + (evt.index+1) + ' / ' + evt.total +
-          ' — ' + evt.elapsed + 's round-trip';
-        progressBar.value = evt.index + 1;
-        knowledgeView.innerHTML = renderKnowledgeHTML(evt.knowledge);
-        knowledgeView.classList.remove('empty');
-        latencyPoints.push(evt.elapsed);
-        progressPoints.push((evt.index+1) / evt.total);
-
-        const keys = computeContributedKeys(evt.delta);
-        let entry = sentenceHistory.find(s => s.index === evt.index);
-        if (!entry){ entry = {index: evt.index, context: evt.context}; sentenceHistory.push(entry); }
-        entry.contributedKeys = keys;
-        entry.chunkPreview = buildChunkPreview(evt.delta);
-
-        hitMissPoints.push(keys.length > 0);
-        redrawCharts();
-        renderGraph();
-
-        if (entry.chunkPreview){
-          addExtractedBox(evt.index, entry.chunkPreview);
-          updateExtractionRecords(entry, evt.delta);
-        }
-        break;
-      }
-      case 'run_done':
-        setBanner('good', evt.stopped_early ? 'Stopped early — knowledge collected so far is shown above.'
-                                             : 'Done — knowledge JSON above is the full result.');
-        logRow('[' + evt.ts + '] run finished' + (evt.stopped_early ? ' (stopped early)' : ''));
-        startBtn.disabled = false; stopBtn.disabled = true;
-        break;
-      case 'stopped':
-        logRow('[' + evt.ts + '] stopped by user');
-        startBtn.disabled = false; stopBtn.disabled = true;
-        break;
-      case 'error':
-        setBanner('error', evt.message);
-        logRow('[' + evt.ts + '] ERROR: ' + evt.message);
-        startBtn.disabled = false; stopBtn.disabled = true;
-        break;
-    }
-  }
-
-  renderGraph();
 })();
 </script>
 </body>
@@ -1258,7 +1725,7 @@ INDEX_HTML = """<!DOCTYPE html>
 # ---------------------------------------------------------------------------
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "Deepship/2.0"
+    server_version = "Deepship/3.0"
 
     def log_message(self, fmt, *args):
         pass  # keep the console quiet; the browser shows everything
@@ -1289,18 +1756,29 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             body = {}
 
-        if self.path == "/api/start":
-            site = (body.get("site") or "").strip()
-            if RUN_STATE["running"]:
-                self._send(409, json.dumps({"error": "a run is already in progress"}), "application/json")
-                return
-            threading.Thread(target=run_pipeline, args=(site,), daemon=True).start()
-            self._send(200, json.dumps({"ok": True}), "application/json")
-        elif self.path == "/api/stop":
-            RUN_STATE["stop_flag"] = True
-            self._send(200, json.dumps({"ok": True}), "application/json")
+        if self.path == "/api/snipe/start":
+            self._start("snipe", run_pipeline_snipe, body)
+        elif self.path == "/api/snipe/stop":
+            self._stop("snipe")
+        elif self.path == "/api/filter/start":
+            self._start("filter", run_pipeline_filter, body)
+        elif self.path == "/api/filter/stop":
+            self._stop("filter")
         else:
             self._send(404, "not found")
+
+    def _start(self, section, pipeline_fn, body):
+        site = (body.get("site") or "").strip()
+        model = (body.get("model") or "").strip() or None
+        if RUN_STATE[section]["running"]:
+            self._send(409, json.dumps({"error": f"a {section} run is already in progress"}), "application/json")
+            return
+        threading.Thread(target=pipeline_fn, args=(site, model), daemon=True).start()
+        self._send(200, json.dumps({"ok": True}), "application/json")
+
+    def _stop(self, section):
+        RUN_STATE[section]["stop_flag"] = True
+        self._send(200, json.dumps({"ok": True}), "application/json")
 
     def _status(self):
         try:
@@ -1349,10 +1827,12 @@ def run_server(host="127.0.0.1", port=8765, open_browser=True):
 
 
 # ---------------------------------------------------------------------------
-# Headless CLI (writes a JSON file, no browser)
+# Headless CLI (writes a JSON file, no browser) -- runs the filter pass
 # ---------------------------------------------------------------------------
 
-def _run_cli(site, output_path):
+def _run_cli(site, output_path, mode="filter"):
+    section = "snipe" if mode == "snipe" else "filter"
+    pipeline_fn = run_pipeline_snipe if section == "snipe" else run_pipeline_filter
     done = threading.Event()
     result = {}
 
@@ -1361,16 +1841,19 @@ def _run_cli(site, output_path):
         while True:
             payload = q.get()
             evt = json.loads(payload)
+            if evt.get("section") != section:
+                continue
             name = evt.get("event")
-            if name == "sentence_done":
-                print(f"  [{evt['index']+1}/{evt['total']}] ({evt['elapsed']}s) "
-                      f"context={evt.get('delta')}")
+            if name in ("sentence_done", "para_done"):
+                extra = evt.get("delta") if name == "sentence_done" else evt.get("sentences")
+                idx, total, elapsed = evt.get("index"), evt.get("total"), evt.get("elapsed")
+                print(f"  [{idx+1}/{total}] ({elapsed}s) {extra}")
             elif name in ("crawl_start", "crawl_done", "triage_fallback",
                           "candidate_found", "page_extracted"):
-                extra = {k: v for k, v in evt.items() if k not in ("event", "ts")}
+                extra = {k: v for k, v in evt.items() if k not in ("event", "ts", "section")}
                 print(f"-- {name}: {extra}")
             elif name == "run_done":
-                result["knowledge"] = evt.get("knowledge")
+                result["data"] = evt.get("knowledge") if section == "filter" else evt.get("hits")
                 done.set()
                 return
             elif name in ("stopped", "error"):
@@ -1380,12 +1863,12 @@ def _run_cli(site, output_path):
                 return
 
     threading.Thread(target=listener, daemon=True).start()
-    run_pipeline(site)
+    pipeline_fn(site)
     done.wait()
 
-    if result.get("knowledge"):
+    if result.get("data") is not None:
         with open(output_path, "w", encoding="utf-8") as f:
-            json.dump(result["knowledge"], f, indent=2, ensure_ascii=False)
+            json.dump(result["data"], f, indent=2, ensure_ascii=False)
         print(f"\nSaved to {output_path}")
     else:
         print("\nNo result produced.", file=sys.stderr)
@@ -1399,17 +1882,22 @@ def _run_cli(site, output_path):
 def main():
     parser = argparse.ArgumentParser(
         description="Crawl ONE college site, find its financial-aid/scholarships page, and "
-                     "learn what it says one sentence at a time via a local qwen2.5 Ollama "
-                     "server. Run with no arguments to launch the live web GUI instead."
+                     "either (a) snipe verbatim scholarship sentences out of whole paragraphs, or "
+                     "(b) run the full sentence-by-sentence structured filter pass, via a local "
+                     "qwen2.5 Ollama server. Run with no arguments to launch the live web GUI "
+                     "instead, where each of the two is its own section with its own Run button."
     )
     parser.add_argument("site", nargs="?", help="College domain, e.g. princeton.edu (CLI mode)")
     parser.add_argument("--output", default="deepship_result.json", help="Where to write JSON (CLI mode)")
+    parser.add_argument("--mode", choices=["filter", "snipe"], default="filter",
+                        help="CLI mode: 'filter' (default, structured knowledge JSON) or "
+                             "'snipe' (verbatim scholarship sentences)")
     parser.add_argument("--port", type=int, default=8765, help="Port for the web GUI (default: 8765)")
     parser.add_argument("--no-browser", action="store_true", help="Don't auto-open the browser")
     args = parser.parse_args()
 
     if args.site:
-        _run_cli(args.site, args.output)
+        _run_cli(args.site, args.output, mode=args.mode)
     else:
         run_server(port=args.port, open_browser=not args.no_browser)
 
