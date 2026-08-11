@@ -118,6 +118,8 @@ OLLAMA_TAGS_URL = f"{OLLAMA_BASE_URL}/api/tags"
 HTTP_HEADERS = {"User-Agent": "Mozilla/5.0 (deepship/2.0 crawler)"}
 REQUEST_TIMEOUT = 20        # page fetches
 MODEL_TIMEOUT = 120         # local model round-trips can be slow -- be patient
+MAX_RETRIES = 3             # network/model calls get this many attempts total
+RETRY_BACKOFF = 2.0         # seconds, doubles each retry (2, 4, 8...)
 
 
 # ---------------------------------------------------------------------------
@@ -183,6 +185,28 @@ def _strip_fences(text):
     return text.strip()
 
 
+def _with_retries(fn, what, max_retries=MAX_RETRIES, backoff=RETRY_BACKOFF):
+    """Runs fn() with retries on network errors (timeouts, connection resets,
+    etc). Publishes a 'retry' event to the bus between attempts so the UI can
+    show it happening, instead of just dying on the first hiccup."""
+    last_exc = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            return fn()
+        except requests.RequestException as e:
+            last_exc = e
+            if attempt >= max_retries:
+                break
+            wait = backoff * (2 ** (attempt - 1))
+            try:
+                bus.publish("retry", what=what, attempt=attempt, max_retries=max_retries,
+                            wait=round(wait, 1), message=str(e))
+            except NameError:
+                pass  # bus not defined yet (shouldn't happen once module is loaded)
+            time.sleep(wait)
+    raise last_exc
+
+
 def _call_ollama(messages, timeout=MODEL_TIMEOUT):
     payload = {
         "model": OLLAMA_MODEL,
@@ -190,12 +214,16 @@ def _call_ollama(messages, timeout=MODEL_TIMEOUT):
         "messages": messages,
         "options": {"temperature": 0},
     }
-    t0 = time.time()
-    resp = requests.post(OLLAMA_CHAT_URL, json=payload, timeout=timeout)
-    resp.raise_for_status()
-    elapsed = time.time() - t0
-    content = (resp.json().get("message") or {}).get("content", "")
-    return _strip_fences(content), elapsed
+
+    def attempt():
+        t0 = time.time()
+        resp = requests.post(OLLAMA_CHAT_URL, json=payload, timeout=timeout)
+        resp.raise_for_status()
+        elapsed = time.time() - t0
+        content = (resp.json().get("message") or {}).get("content", "")
+        return _strip_fences(content), elapsed
+
+    return _with_retries(attempt, "model round-trip")
 
 
 ASK_SYSTEM_PROMPT = (
@@ -258,9 +286,12 @@ def ask_qwen_pick_link(links):
 # ---------------------------------------------------------------------------
 
 def fetch_html(url):
-    r = requests.get(url, headers=HTTP_HEADERS, timeout=REQUEST_TIMEOUT)
-    r.raise_for_status()
-    return r.text
+    def attempt():
+        r = requests.get(url, headers=HTTP_HEADERS, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        return r.text
+
+    return _with_retries(attempt, f"fetch {url}")
 
 
 def extract_links(base_url, html):
@@ -541,13 +572,18 @@ INDEX_HTML = """<!DOCTYPE html>
     max-height:200px;overflow-y:auto;}
   #log .row{white-space:pre-wrap;word-break:break-word;}
 
-  /* -- right column: site preview + node graph -- */
-  #previewFrame{
-    width:100%;height:230px;border:1px solid var(--border);border-radius:8px;background:#fafafa;
+  /* -- right column: extracted-data boxes + node graph -- */
+  .extracted-grid{display:flex;flex-wrap:wrap;gap:8px;max-height:230px;overflow-y:auto;align-content:flex-start;}
+  .extracted-box{
+    border-radius:8px;border:1.4px solid var(--border-strong);padding:8px 10px;font-size:11.5px;
+    line-height:1.45;background:#fff;max-width:200px;flex:1 1 150px;
+    animation:pop .18s ease-out;
   }
-  #previewNote{font-size:11px;color:var(--muted);margin-top:6px;}
-  #previewUrl{font-family:var(--mono);font-size:11px;color:var(--muted-strong);margin-top:4px;
-    word-break:break-all;}
+  @keyframes pop{ from{ transform:scale(.92); opacity:0; } to{ transform:scale(1); opacity:1; } }
+  .extracted-box .exb-head{font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:.02em;
+    margin-bottom:4px;display:flex;justify-content:space-between;gap:6px;}
+  .extracted-box .exb-idx{color:var(--muted);font-weight:400;text-transform:none;letter-spacing:0;}
+  .extracted-box .exb-text{color:var(--text);word-break:break-word;}
 
   .legend{display:flex;flex-wrap:wrap;gap:10px;margin-top:10px;font-size:11px;color:var(--muted-strong);}
   .legend .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:5px;vertical-align:middle;}
@@ -602,7 +638,7 @@ INDEX_HTML = """<!DOCTYPE html>
         <h2>Model round-trips</h2>
         <div class="chart-label">latency per request (s)</div>
         <canvas id="latencyChart" width="420" height="90"></canvas>
-        <div class="chart-label" style="margin-top:10px;">sentences processed / total</div>
+        <div class="chart-label" style="margin-top:10px;">sentences processed / total — <span style="color:#1a7f37;">green</span> = hit (useful info), <span style="color:#999;">grey</span> = miss (just another sentence)</div>
         <canvas id="progressChart" width="420" height="90"></canvas>
       </div>
     </div>
@@ -618,18 +654,18 @@ INDEX_HTML = """<!DOCTYPE html>
     </div>
   </div>
 
-  <!-- RIGHT: the site itself, and a node graph of which sentence fed which fact -->
+  <!-- RIGHT: extracted-data boxes, and a node graph of chunk -> sentence -> fact -->
   <div class="col">
     <div class="card">
-      <h2>Site preview <span id="previewWhich" style="color:var(--muted);font-weight:400;text-transform:none;"></span></h2>
-      <iframe id="previewFrame" src="about:blank"></iframe>
-      <div id="previewUrl"></div>
-      <div id="previewNote">Some sites block being embedded here — open the link directly if this stays blank.</div>
+      <h2>Extracted data <span id="extractedCount" style="color:var(--muted);font-weight:400;text-transform:none;"></span></h2>
+      <div id="extractedBoxes" class="extracted-grid">
+        <div class="empty" id="extractedEmpty">Nothing extracted yet — a box appears here every time a sentence yields a useful fact.</div>
+      </div>
     </div>
 
     <div class="card" id="graphCard">
-      <h2>Sentence → knowledge graph</h2>
-      <div id="graphWrap"><svg id="nodeGraph" viewBox="0 0 480 520"></svg></div>
+      <h2>Chunk → sentence → knowledge graph</h2>
+      <div id="graphWrap"><svg id="nodeGraph" viewBox="0 0 640 520"></svg></div>
       <div class="legend" id="legend"></div>
     </div>
   </div>
@@ -645,7 +681,8 @@ INDEX_HTML = """<!DOCTYPE html>
   const contextPill = el('contextPill'), sentenceText = el('sentenceText'), sentenceMeta = el('sentenceMeta');
   const progressBar = el('progressBar'), knowledgeView = el('knowledgeView'), logEl = el('log');
   const latencyCanvas = el('latencyChart'), progressCanvas = el('progressChart');
-  const previewFrame = el('previewFrame'), previewUrl = el('previewUrl'), previewWhich = el('previewWhich');
+  const extractedBoxes = el('extractedBoxes'), extractedCount = el('extractedCount');
+  let extractedEmpty = el('extractedEmpty');
   const nodeGraph = el('nodeGraph'), legendEl = el('legend');
 
   const CATEGORY_ORDER = ['financial_aid_overview','scholarships','amounts','deadlines','how_to_apply','notes'];
@@ -662,7 +699,8 @@ INDEX_HTML = """<!DOCTYPE html>
 
   let latencyPoints = [];
   let progressPoints = [];
-  let sentenceHistory = [];      // {index, context, contributedKeys}
+  let hitMissPoints = [];        // parallel to progressPoints: true = sentence yielded a fact
+  let sentenceHistory = [];      // {index, context, contributedKeys, chunkPreview}
   const MAX_VISIBLE_NODES = 9;
 
   function buildLegend(){
@@ -723,9 +761,43 @@ INDEX_HTML = """<!DOCTYPE html>
     ctx.beginPath(); ctx.arc(w-2,lastY,3,0,Math.PI*2); ctx.fill();
   }
 
+  function drawProgressWithHits(canvas, values, hits, color){
+    const ctx = canvas.getContext('2d');
+    const w = canvas.width, h = canvas.height;
+    ctx.clearRect(0,0,w,h);
+    ctx.strokeStyle = '#eee'; ctx.lineWidth = 1;
+    for (let i=1;i<4;i++){
+      const y = h - (h*i/4);
+      ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(w,y); ctx.stroke();
+    }
+    // hit/miss strip along the bottom: green = useful info found, grey = just another sentence
+    if (hits.length){
+      const bw = w / hits.length;
+      hits.forEach((hit, i) => {
+        ctx.globalAlpha = hit ? 0.9 : 0.55;
+        ctx.fillStyle = hit ? '#1a7f37' : '#d4d4d4';
+        ctx.fillRect(i*bw, h-9, Math.max(bw-1,1), 9);
+      });
+      ctx.globalAlpha = 1;
+    }
+    if (values.length < 2) return;
+    const max = Math.max.apply(null, values.concat([0.001]));
+    ctx.strokeStyle = color; ctx.lineWidth = 2;
+    ctx.beginPath();
+    values.forEach((v,i) => {
+      const x = (i/(values.length-1)) * w;
+      const y = h - (v/max) * (h-20) - 5;
+      if (i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+    });
+    ctx.stroke();
+    const lastY = h - (values[values.length-1]/max) * (h-20) - 5;
+    ctx.fillStyle = color;
+    ctx.beginPath(); ctx.arc(w-2,lastY,3,0,Math.PI*2); ctx.fill();
+  }
+
   function redrawCharts(){
     drawLine(latencyCanvas, latencyPoints, '#1a1a1a');
-    drawLine(progressCanvas, progressPoints, '#1d4ed8');
+    drawProgressWithHits(progressCanvas, progressPoints, hitMissPoints, '#1d4ed8');
   }
 
   function computeContributedKeys(delta){
@@ -742,20 +814,60 @@ INDEX_HTML = """<!DOCTYPE html>
     return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
   }
 
+  function buildChunkPreview(delta){
+    const keys = computeContributedKeys(delta);
+    if (!keys.length) return null;
+    const k = keys[0];
+    let v = delta[k];
+    let first = Array.isArray(v) ? v[0] : v;
+    let text = typeof first === 'string' ? first : JSON.stringify(first);
+    text = (text || '').trim();
+    if (text.length > 46) text = text.slice(0, 43) + '…';
+    return { key: k, text: text || '(added)' };
+  }
+
+  function addExtractedBox(index, chunk){
+    if (extractedEmpty){ extractedEmpty.remove(); extractedEmpty = null; }
+    const color = CATEGORY_COLORS[chunk.key] || '#191919';
+    const box = document.createElement('div');
+    box.className = 'extracted-box';
+    box.style.borderColor = color;
+    box.innerHTML =
+      '<div class="exb-head" style="color:' + color + '">' + svgEsc(CATEGORY_LABELS[chunk.key] || chunk.key) +
+      '<span class="exb-idx">S' + (index+1) + '</span></div>' +
+      '<div class="exb-text">' + svgEsc(chunk.text) + '</div>';
+    extractedBoxes.appendChild(box);
+    extractedCount.textContent = '(' + extractedBoxes.children.length + ')';
+    extractedBoxes.scrollTop = extractedBoxes.scrollHeight;
+  }
+
   function renderGraph(){
-    const W = 480, H = 520;
+    const W = 640, H = 520;
     const catX = W - 128;
     const catGap = H / (CATEGORY_ORDER.length + 1);
     const catPos = {};
     CATEGORY_ORDER.forEach((cat, i) => { catPos[cat] = { x: catX, y: catGap * (i+1) }; });
 
     const visible = sentenceHistory.slice(-MAX_VISIBLE_NODES);
-    const sentX = 24;
+    const sentX = 156;
     const sentGap = H / (MAX_VISIBLE_NODES + 1);
+    const chunkX = 16;
+    const chunkW = 116;
 
     let parts = [];
 
-    // wires (drawn first, under the nodes)
+    // wires: extracted-data chunk box -> the sentence node that produced it (new)
+    visible.forEach((s, i) => {
+      if (!s.chunkPreview) return;
+      const sy = sentGap * (i+1);
+      const x1 = chunkX + chunkW, y1 = sy, x2 = sentX, y2 = sy;
+      const mx = (x1+x2)/2;
+      const d = 'M ' + x1 + ' ' + y1 + ' C ' + mx + ' ' + y1 + ', ' + mx + ' ' + y2 + ', ' + x2 + ' ' + y2;
+      const color = CATEGORY_COLORS[s.chunkPreview.key] || '#999';
+      parts.push('<path d="' + d + '" fill="none" stroke="' + color + '" stroke-width="1.4" opacity="0.45"/>');
+    });
+
+    // wires (drawn first, under the nodes) -- sentence -> category, kept as-is
     visible.forEach((s, i) => {
       const sy = sentGap * (i+1);
       (s.contributedKeys || []).forEach(key => {
@@ -789,6 +901,18 @@ INDEX_HTML = """<!DOCTYPE html>
         '<rect x="' + sentX + '" y="' + (sy-14) + '" width="92" height="28" rx="8" fill="#ffffff" stroke="' + color +
           '" stroke-width="' + (hasDelta ? 1.8 : 1) + '" opacity="' + (hasDelta ? 1 : 0.55) + '"/>' +
         '<text x="' + (sentX+8) + '" y="' + (sy+4) + '" font-size="10" fill="' + color + '">S' + (s.index+1) + ' · ' + svgEsc(kind) + '</text>'
+      );
+    });
+
+    // extracted-data chunk nodes (far left, new) -- only sentences that hit
+    visible.forEach((s, i) => {
+      if (!s.chunkPreview) return;
+      const sy = sentGap * (i+1);
+      const color = CATEGORY_COLORS[s.chunkPreview.key] || '#999';
+      parts.push(
+        '<rect x="' + chunkX + '" y="' + (sy-15) + '" width="' + chunkW + '" height="30" rx="8" fill="#fbfbfb" stroke="' + color + '" stroke-width="1.4"/>' +
+        '<text x="' + (chunkX+8) + '" y="' + (sy-2) + '" font-size="8.5" fill="' + color + '" font-weight="600">' + svgEsc(CATEGORY_LABELS[s.chunkPreview.key] || '') + '</text>' +
+        '<text x="' + (chunkX+8) + '" y="' + (sy+9) + '" font-size="8.5" fill="#555">' + svgEsc(s.chunkPreview.text) + '</text>'
       );
     });
 
@@ -832,8 +956,10 @@ INDEX_HTML = """<!DOCTYPE html>
     progressBar.value = 0; progressBar.max = 1;
     knowledgeView.textContent = '{}';
     logEl.innerHTML = '';
-    latencyPoints = []; progressPoints = []; sentenceHistory = [];
-    previewFrame.src = 'about:blank'; previewUrl.textContent = ''; previewWhich.textContent = '';
+    latencyPoints = []; progressPoints = []; hitMissPoints = []; sentenceHistory = [];
+    extractedBoxes.innerHTML = '<div class="empty" id="extractedEmpty">Nothing extracted yet — a box appears here every time a sentence yields a useful fact.</div>';
+    extractedEmpty = el('extractedEmpty');
+    extractedCount.textContent = '';
     redrawCharts(); renderGraph();
   }
 
@@ -875,10 +1001,12 @@ INDEX_HTML = """<!DOCTYPE html>
     switch(evt.event){
       case 'crawl_start': {
         logRow('[' + evt.ts + '] crawling ' + evt.site);
-        const url = evt.site.indexOf('http') === 0 ? evt.site : ('https://' + evt.site);
-        previewFrame.src = url; previewUrl.textContent = url; previewWhich.textContent = '(homepage)';
         break;
       }
+      case 'retry':
+        setBanner('error', 'network hiccup on ' + evt.what + ' — retrying (attempt ' + evt.attempt + '/' + evt.max_retries + ' failed: ' + evt.message + '), waiting ' + evt.wait + 's…');
+        logRow('[' + evt.ts + '] retry — ' + evt.what + ' failed (' + evt.message + '), attempt ' + evt.attempt + '/' + evt.max_retries + ', waiting ' + evt.wait + 's');
+        break;
       case 'crawl_done':
         crawlBody.textContent = evt.link_count + ' link(s) found on the homepage.';
         linksSample.textContent = (evt.sample || []).join('\\n');
@@ -890,7 +1018,6 @@ INDEX_HTML = """<!DOCTYPE html>
       case 'candidate_found':
         crawlBody.textContent = 'Candidate financial-aid page: ' + evt.url;
         logRow('[' + evt.ts + '] candidate page -> ' + evt.url);
-        previewFrame.src = evt.url; previewUrl.textContent = evt.url; previewWhich.textContent = '(candidate finaid page)';
         break;
       case 'page_extracted':
         crawlBody.textContent = 'Extracted ' + evt.item_count + ' sentence(s) from ' + evt.url;
@@ -915,13 +1042,18 @@ INDEX_HTML = """<!DOCTYPE html>
         knowledgeView.classList.remove('empty');
         latencyPoints.push(evt.elapsed);
         progressPoints.push((evt.index+1) / evt.total);
-        redrawCharts();
 
         const keys = computeContributedKeys(evt.delta);
         let entry = sentenceHistory.find(s => s.index === evt.index);
         if (!entry){ entry = {index: evt.index, context: evt.context}; sentenceHistory.push(entry); }
         entry.contributedKeys = keys;
+        entry.chunkPreview = buildChunkPreview(evt.delta);
+
+        hitMissPoints.push(keys.length > 0);
+        redrawCharts();
         renderGraph();
+
+        if (entry.chunkPreview) addExtractedBox(evt.index, entry.chunkPreview);
         break;
       }
       case 'run_done':
