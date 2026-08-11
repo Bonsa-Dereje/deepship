@@ -329,6 +329,102 @@ def snipe_category(financial_aid, amount_mentioned):
     return None
 
 
+# --- SNIPE: detail-ranking pass -- runs after a paragraph's sentences are
+# all classified, comparing each pair of CONSECUTIVE highlighted sentences
+# (in the order they appear in the paragraph) and asking qwen which one
+# carries more concrete detail. Each win is tallied, then every highlighted
+# sentence in the paragraph is graded from 0 (least detail) up to N-1
+# (most detail), where N is how many highlighted sentences were in that
+# paragraph -- so the grade scale is always "0 to the number of sentences".
+
+DETAIL_COMPARE_SYSTEM_PROMPT = (
+    "You will be given two sentences, A and B, both copied verbatim from "
+    "the same college financial-aid webpage, plus the context they came "
+    "from. Decide which sentence carries MORE concrete detail about "
+    "financial aid or scholarships -- specific dollar amounts, named "
+    "programs, eligibility rules, deadlines, or procedures -- rather than "
+    "being vague or general. Reply with ONLY this JSON shape: "
+    "{\"more_detailed\": \"A\"|\"B\", \"reason\": \"...\"} where reason is "
+    "under 20 words. No markdown, no commentary outside that JSON."
+)
+
+
+def build_detail_compare_messages(sentence_a, sentence_b, context_tag):
+    user_payload = {"context": context_tag, "A": sentence_a, "B": sentence_b}
+    return [
+        {"role": "system", "content": DETAIL_COMPARE_SYSTEM_PROMPT},
+        {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False, indent=2)},
+    ]
+
+
+def ask_qwen_compare_detail(messages, section="snipe", model=None):
+    raw, elapsed = _call_ollama(messages, section=section, model=model)
+    winner, reason = "A", ""
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            w = parsed.get("more_detailed")
+            if w in ("A", "B"):
+                winner = w
+            r = parsed.get("reason")
+            reason = r.strip() if isinstance(r, str) else ""
+    except Exception:
+        pass
+    return winner, reason, elapsed, raw
+
+
+def rank_block_hits_by_detail(block_hits, context_tag, section, model, block_index, blocks_total):
+    """Mutates each dict in block_hits in place, adding "detail_grade" (0 ..
+    N-1) and "detail_max" (N-1). Publishes 'detail_compare_*' events for each
+    consecutive pair checked, then one 'para_ranked' event with the full
+    grading and the single highest-detail ("number one") sentence."""
+    n = len(block_hits)
+    if n == 0:
+        return
+    if n == 1:
+        block_hits[0]["detail_grade"] = 0
+        block_hits[0]["detail_max"] = 0
+        top = block_hits[0]
+        bus.publish("para_ranked", section=section, index=block_index, total=blocks_total, count=1,
+                    ranked=[{"sentence": top["sentence"], "grade": 0, "category": top["category"],
+                             "start": top.get("start"), "end": top.get("end")}],
+                    top={"sentence": top["sentence"], "grade": 0, "category": top["category"],
+                         "start": top.get("start"), "end": top.get("end")})
+        return
+
+    scores = [0] * n
+    for i in range(n - 1):
+        a, b = block_hits[i], block_hits[i + 1]
+        messages = build_detail_compare_messages(a["sentence"], b["sentence"], context_tag)
+        bus.publish("detail_compare_start", section=section, index=block_index, total=blocks_total,
+                    pair_index=i, pair_total=n - 1, sentence_a=a["sentence"], sentence_b=b["sentence"])
+        winner, reason, elapsed, raw = ask_qwen_compare_detail(messages, section=section, model=model)
+        if winner == "A":
+            scores[i] += 1
+        else:
+            scores[i + 1] += 1
+        bus.publish("detail_compare_done", section=section, index=block_index, total=blocks_total,
+                    pair_index=i, pair_total=n - 1, winner=winner, reason=reason, elapsed=round(elapsed, 2),
+                    sentence_a=a["sentence"], sentence_b=b["sentence"])
+
+    # Stable sort ascending by win-count: ties keep their original order in
+    # the paragraph, so the earlier-appearing sentence of a tied pair grades
+    # slightly lower. Position in this order IS the grade (0 .. n-1).
+    order = sorted(range(n), key=lambda idx: scores[idx])
+    for grade, idx in enumerate(order):
+        block_hits[idx]["detail_grade"] = grade
+        block_hits[idx]["detail_max"] = n - 1
+
+    ranked_payload = [{"sentence": h["sentence"], "grade": h["detail_grade"], "category": h["category"],
+                        "start": h.get("start"), "end": h.get("end")} for h in block_hits]
+    top_idx = order[-1]
+    top = block_hits[top_idx]
+    bus.publish("para_ranked", section=section, index=block_index, total=blocks_total, count=n,
+                ranked=ranked_payload,
+                top={"sentence": top["sentence"], "grade": top["detail_grade"], "category": top["category"],
+                     "start": top.get("start"), "end": top.get("end")})
+
+
 def split_sentences_with_spans(text):
     """Splits `text` into sentences AND returns each one's exact (start, end)
     offset within `text`, so the UI can highlight precisely without any
@@ -617,6 +713,7 @@ def run_pipeline_snipe(site, model=None):
 
             spans = split_sentences_with_spans(block["text"])
             block_hit_count = 0
+            block_hits = []  # hits found in THIS block, in textual order -- fed to the detail ranker below
             for j, (sentence, start, end) in enumerate(spans):
                 if RUN_STATE[section]["stop_flag"]:
                     bus.publish("stopped", section=section); break
@@ -631,15 +728,24 @@ def run_pipeline_snipe(site, model=None):
 
                 if category:
                     block_hit_count += 1
-                    all_hits.append({
+                    hit = {
                         "index": i, "sentence": sentence, "category": category, "reason": reason,
-                        "context": block["context"], "url": candidate["url"],
-                    })
+                        "context": block["context"], "url": candidate["url"], "start": start, "end": end,
+                    }
+                    all_hits.append(hit)
+                    block_hits.append(hit)
 
                 bus.publish("sentence_check_done", section=section, index=i, total=len(blocks),
                             sent_index=j, sent_total=len(spans), sentence=sentence, start=start, end=end,
                             context=block["context"], financial_aid=financial_aid, amount_mentioned=amount_mentioned,
                             reason=reason, category=category, elapsed=round(elapsed, 2), hits_so_far=len(all_hits))
+
+            # Once every sentence in this paragraph has been highlighted (or
+            # not), compare the highlighted ones pairwise -- consecutive
+            # sentences only, in the order they appear -- to grade each one
+            # from 0 up to (count-1) by how much detail it carries.
+            if block_hits and not RUN_STATE[section]["stop_flag"]:
+                rank_block_hits_by_detail(block_hits, block["context"], section, model, i, len(blocks))
 
             bus.publish("para_done", section=section, index=i, total=len(blocks),
                         context=block["context"], text=block["text"],
@@ -678,6 +784,7 @@ INDEX_HTML = """<!DOCTYPE html>
     --c-hit-aid:#1a7f37; --c-hit-aid-bg:#dcf5e4;
     --c-hit-amount:#1d4ed8; --c-hit-amount-bg:#dfe9ff;
     --c-hit-both:#7c3aed; --c-hit-both-bg:#ede4fd;
+    --detail:#b45309; --detail-bg:#fef3e2; --detail-border:#f3d19e;
     --font:-apple-system,BlinkMacSystemFont,"SF Pro Text","Helvetica Neue",Arial,sans-serif;
     --mono:"SF Mono", ui-monospace, Menlo, Consolas, monospace;
   }
@@ -771,6 +878,21 @@ INDEX_HTML = """<!DOCTYPE html>
   .snipe-legend .swatch.cat-aid{background:var(--c-hit-aid);}
   .snipe-legend .swatch.cat-amount{background:var(--c-hit-amount);}
   .snipe-legend .swatch.cat-both{background:var(--c-hit-both);}
+
+  mark.snipe-hit .grade-badge{
+    font-size:9px;font-weight:800;vertical-align:super;margin-left:3px;opacity:.8;
+  }
+
+  .detail-top-box{
+    margin-top:12px;padding:10px 12px;border-radius:8px;
+    background:var(--detail-bg);border:1.4px solid var(--detail-border);
+  }
+  .detail-top-box .dtb-label{
+    font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;
+    color:var(--detail);display:block;margin-bottom:4px;
+  }
+  .detail-top-box .dtb-text{font-size:13px;line-height:1.5;color:var(--text);font-weight:600;}
+  .detail-top-box .dtb-meta{font-size:11px;color:var(--muted-strong);margin-top:4px;}
 
   .snipe-reason-box{
     margin-top:10px;padding:9px 12px;border-radius:8px;background:var(--pill-bg);border:1px solid var(--border);
@@ -933,6 +1055,10 @@ INDEX_HTML = """<!DOCTYPE html>
       <span class="item"><span class="swatch cat-aid"></span>talks about financial aid / a scholarship / a grant</span>
       <span class="item"><span class="swatch cat-amount"></span>states an amount</span>
       <span class="item"><span class="swatch cat-both"></span>both in one sentence</span>
+    </div>
+    <div class="detail-top-box" id="snipeDetailTop">
+      <span class="dtb-label">Most detailed sentence in this paragraph</span>
+      <span class="empty">Not enough highlighted sentences yet — appears once at least one is found and compared.</span>
     </div>
   </div>
 
@@ -1196,6 +1322,7 @@ INDEX_HTML = """<!DOCTYPE html>
     const hitList = el('snipeHitList'), hitCount = el('snipeHitCount');
     let hitEmpty = el('snipeHitEmpty');
     const logEl = el('snipeLog');
+    const detailTop = el('snipeDetailTop');
 
     let currentParaText = '';
     let currentHighlights = []; // [{start,end,category}], filled in as sentences are checked
@@ -1209,6 +1336,8 @@ INDEX_HTML = """<!DOCTYPE html>
       paraMeta.textContent = '';
       progressBar.value = 0; progressBar.max = 1;
       reasonBox.innerHTML = '<span class="empty">The sentence being checked, and the model\\'s reason, appear here as it works through the paragraph.</span>';
+      detailTop.innerHTML = '<span class="dtb-label">Most detailed sentence in this paragraph</span>' +
+        '<span class="empty">Not enough highlighted sentences yet — appears once at least one is found and compared.</span>';
       currentParaText = ''; currentHighlights = [];
       logEl.innerHTML = '';
       hitList.innerHTML = '<div class="empty" id="snipeHitEmpty">Nothing found yet — a card appears here every time a sentence comes back true for aid or amount.</div>';
@@ -1234,7 +1363,8 @@ INDEX_HTML = """<!DOCTYPE html>
       let out = '', pos = 0;
       spans.forEach(sp => {
         if (sp.start > pos) out += svgEsc(currentParaText.slice(pos, sp.start));
-        out += '<mark class="snipe-hit cat-' + sp.category + '">' + svgEsc(currentParaText.slice(sp.start, sp.end)) + '</mark>';
+        const badge = (sp.grade == null) ? '' : '<span class="grade-badge">G' + sp.grade + '</span>';
+        out += '<mark class="snipe-hit cat-' + sp.category + '">' + svgEsc(currentParaText.slice(sp.start, sp.end)) + badge + '</mark>';
         pos = sp.end;
       });
       if (pos < currentParaText.length) out += svgEsc(currentParaText.slice(pos));
@@ -1289,6 +1419,8 @@ INDEX_HTML = """<!DOCTYPE html>
           currentHighlights = [];
           paraText.textContent = evt.text; paraText.classList.remove('empty');
           paraMeta.textContent = 'paragraph ' + (evt.index+1) + ' / ' + evt.total + ' — splitting into sentences…';
+          detailTop.innerHTML = '<span class="dtb-label">Most detailed sentence in this paragraph</span>' +
+            '<span class="empty">Not enough highlighted sentences yet — appears once at least one is found and compared.</span>';
           break;
         }
         case 'sentence_check_start':
@@ -1305,6 +1437,29 @@ INDEX_HTML = """<!DOCTYPE html>
             (cat ? ' — matched: ' + CAT_LABEL[cat] : ' — no match');
           if (cat){
             addHitCard(evt.index, evt.context || '', evt.sentence, cat);
+          }
+          break;
+        }
+        case 'detail_compare_start':
+          paraMeta.textContent = 'paragraph ' + (evt.index+1) + ' / ' + evt.total +
+            ' — comparing detail: pair ' + (evt.pair_index+1) + ' / ' + evt.pair_total + '…';
+          break;
+        case 'detail_compare_done':
+          paraMeta.textContent = 'paragraph ' + (evt.index+1) + ' / ' + evt.total +
+            ' — detail comparison ' + (evt.pair_index+1) + ' / ' + evt.pair_total + ' done (' + evt.elapsed + 's)';
+          break;
+        case 'para_ranked': {
+          (evt.ranked || []).forEach(r => {
+            const hl = currentHighlights.find(h => h.start === r.start && h.end === r.end);
+            if (hl) hl.grade = r.grade;
+          });
+          renderParagraph();
+          if (evt.top){
+            detailTop.innerHTML =
+              '<span class="dtb-label">Most detailed sentence in this paragraph</span>' +
+              '<span class="dtb-text">' + svgEsc(evt.top.sentence) + '</span>' +
+              '<span class="dtb-meta">detail grade ' + evt.top.grade + ' of ' + (evt.count-1) +
+              ' — #1 of ' + evt.count + ' highlighted sentence(s) in this paragraph</span>';
           }
           break;
         }
