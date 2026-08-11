@@ -245,13 +245,25 @@ ASK_SYSTEM_PROMPT = (
 )
 
 
-def ask_qwen_for_sentence(knowledge, sentence, context_tag):
+def build_ask_messages(knowledge, sentence, context_tag):
+    """Builds the exact messages list that will be sent to the model for one
+    sentence -- pulled out on its own so the caller can show the full prompt
+    in the UI *before* the round-trip completes, not just log it after."""
     trimmed_known = trim_knowledge_for_prompt(knowledge)
     user_payload = {"known": trimmed_known, "context": context_tag, "sentence": sentence}
-    messages = [
+    return [
         {"role": "system", "content": ASK_SYSTEM_PROMPT},
-        {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
+        {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False, indent=2)},
     ]
+
+
+def format_prompt_for_display(messages):
+    """Renders a messages list as the full, literal text that goes to Ollama
+    -- for the UI's 'prompt sent to the model' panel."""
+    return "\n\n".join(f"[{m['role'].upper()}]\n{m['content']}" for m in messages)
+
+
+def ask_qwen_for_sentence(messages):
     raw, elapsed = _call_ollama(messages)
     try:
         delta = json.loads(raw)
@@ -452,14 +464,18 @@ def run_pipeline(site):
             if RUN_STATE["stop_flag"]:
                 bus.publish("stopped"); break
 
-            bus.publish("sentence_start", index=i, total=len(items),
-                        text=item["text"], context=item["context"])
+            messages = build_ask_messages(knowledge, item["text"], item["context"])
+            full_prompt = format_prompt_for_display(messages)
 
-            delta, elapsed, raw = ask_qwen_for_sentence(knowledge, item["text"], item["context"])
+            bus.publish("sentence_start", index=i, total=len(items),
+                        text=item["text"], context=item["context"], prompt=full_prompt)
+
+            delta, elapsed, raw = ask_qwen_for_sentence(messages)
             knowledge = merge_knowledge(knowledge, delta)
 
             bus.publish("sentence_done", index=i, total=len(items),
-                        elapsed=round(elapsed, 2), delta=delta, knowledge=knowledge, raw=raw[:600])
+                        elapsed=round(elapsed, 2), delta=delta, knowledge=knowledge, raw=raw[:600],
+                        prompt=full_prompt)
 
         bus.publish("run_done", knowledge=knowledge, stopped_early=RUN_STATE["stop_flag"])
         return knowledge
@@ -568,9 +584,15 @@ INDEX_HTML = """<!DOCTYPE html>
   .msg-error{color:var(--error);background:var(--error-bg);padding:10px 14px;border-radius:10px;font-size:13px;}
   .msg-good{color:var(--good);background:var(--good-bg);padding:10px 14px;border-radius:10px;font-size:13px;}
 
-  #log{font-family:var(--mono);font-size:11.5px;line-height:1.7;color:var(--muted-strong);
+  #log, #logTable{font-family:var(--mono);font-size:11.5px;line-height:1.7;color:var(--muted-strong);
     max-height:200px;overflow-y:auto;}
-  #log .row{white-space:pre-wrap;word-break:break-word;}
+  #log .row, #logTable .row{white-space:pre-wrap;word-break:break-word;}
+
+  pre#promptView{
+    font-family:var(--mono);font-size:11px;line-height:1.5;white-space:pre-wrap;word-break:break-word;
+    max-height:260px;overflow-y:auto;margin:10px 0 0;padding:10px 12px;border-radius:8px;
+    background:var(--pill-bg);color:var(--text);border:1px solid var(--border);
+  }
 
   /* -- right column: extracted-data boxes + node graph -- */
   .extracted-grid{display:flex;flex-wrap:wrap;gap:8px;max-height:230px;overflow-y:auto;align-content:flex-start;}
@@ -584,6 +606,31 @@ INDEX_HTML = """<!DOCTYPE html>
     margin-bottom:4px;display:flex;justify-content:space-between;gap:6px;}
   .extracted-box .exb-idx{color:var(--muted);font-weight:400;text-transform:none;letter-spacing:0;}
   .extracted-box .exb-text{color:var(--text);word-break:break-word;}
+
+  /* -- bottom full-width section: data extrapolation table -- */
+  .full-width-section{max-width:1400px;margin:0 auto;padding:0 24px 60px;}
+  .extrap-wrap{overflow-x:auto;}
+  table.extrap-table{width:100%;border-collapse:collapse;font-size:12.5px;}
+  table.extrap-table th{
+    text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.04em;
+    color:var(--muted-strong);padding:8px 12px;border-bottom:1px solid var(--border-strong);
+    white-space:nowrap;
+  }
+  table.extrap-table td{padding:12px;vertical-align:top;border-bottom:1px solid var(--border);line-height:1.5;}
+  table.extrap-table tr:last-child td{border-bottom:none;}
+  table.extrap-table td:nth-child(1){width:36%;color:var(--muted-strong);}
+  table.extrap-table td:nth-child(2){width:24%;}
+  table.extrap-table td:nth-child(3){width:40%;}
+  .extrap-pill{
+    display:inline-block;font-size:10.5px;font-weight:600;padding:3px 9px;border-radius:999px;
+    margin:0 5px 5px 0;white-space:nowrap;
+  }
+  .extrap-url{display:block;margin-top:6px;font-family:var(--mono);font-size:10.5px;color:var(--muted);word-break:break-all;}
+  .extrap-list{list-style:none;margin:0;padding:0;}
+  .extrap-list li{display:flex;align-items:flex-start;gap:6px;margin:0 0 7px;}
+  .extrap-list li:last-child{margin-bottom:0;}
+  .extrap-icon{font-weight:800;font-size:14px;line-height:1.3;flex-shrink:0;}
+  .extrap-item-text{color:var(--text);}
 
   .legend{display:flex;flex-wrap:wrap;gap:10px;margin-top:10px;font-size:11px;color:var(--muted-strong);}
   .legend .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:5px;vertical-align:middle;}
@@ -633,6 +680,8 @@ INDEX_HTML = """<!DOCTYPE html>
         <div id="sentenceText" class="empty">—</div>
         <div id="sentenceMeta"></div>
         <progress id="progressBar" value="0" max="1"></progress>
+        <div class="chart-label" style="margin-top:10px;">Prompt sent to the model (full, this request)</div>
+        <pre id="promptView" class="empty">—</pre>
       </div>
       <div class="card">
         <h2>Model round-trips</h2>
@@ -647,14 +696,9 @@ INDEX_HTML = """<!DOCTYPE html>
       <h2>Knowledge so far <span style="color:var(--muted);font-weight:400;">(re-sent, trimmed, on every request — grown, never lost, here)</span></h2>
       <pre id="knowledgeView" class="empty">{}</pre>
     </div>
-
-    <div class="card">
-      <h2>Event log</h2>
-      <div id="log"></div>
-    </div>
   </div>
 
-  <!-- RIGHT: extracted-data boxes, and a node graph of chunk -> sentence -> fact -->
+  <!-- RIGHT: extracted-data boxes, node graph of chunk -> sentence -> fact, then the event log -->
   <div class="col">
     <div class="card">
       <h2>Extracted data <span id="extractedCount" style="color:var(--muted);font-weight:400;text-transform:none;"></span></h2>
@@ -668,8 +712,34 @@ INDEX_HTML = """<!DOCTYPE html>
       <div id="graphWrap"><svg id="nodeGraph" viewBox="0 0 640 520"></svg></div>
       <div class="legend" id="legend"></div>
     </div>
+
+    <div class="card">
+      <h2>Event log</h2>
+      <div id="log"></div>
+    </div>
   </div>
 
+</div>
+
+<div class="full-width-section">
+  <div class="card">
+    <h2>Data extrapolation <span style="color:var(--muted);font-weight:400;text-transform:none;">— which sentence(s) produced which fact</span></h2>
+    <div class="extrap-wrap">
+      <table class="extrap-table">
+        <thead>
+          <tr><th>Source sentence(s)</th><th>Prompt · tag · URL</th><th>Extracted data</th></tr>
+        </thead>
+        <tbody id="extrapolationBody">
+          <tr><td colspan="3" class="empty" id="extrapolationEmpty">Nothing extrapolated yet.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:16px;">
+    <h2>Event log</h2>
+    <div id="logTable"></div>
+  </div>
 </div>
 
 <script>
@@ -680,10 +750,13 @@ INDEX_HTML = """<!DOCTYPE html>
   const crawlBody = el('crawlBody'), linksSample = el('linksSample');
   const contextPill = el('contextPill'), sentenceText = el('sentenceText'), sentenceMeta = el('sentenceMeta');
   const progressBar = el('progressBar'), knowledgeView = el('knowledgeView'), logEl = el('log');
+  const logTableEl = el('logTable'), promptView = el('promptView');
   const latencyCanvas = el('latencyChart'), progressCanvas = el('progressChart');
   const extractedBoxes = el('extractedBoxes'), extractedCount = el('extractedCount');
   let extractedEmpty = el('extractedEmpty');
   const nodeGraph = el('nodeGraph'), legendEl = el('legend');
+  const extrapolationBody = el('extrapolationBody');
+  let extrapolationEmpty = el('extrapolationEmpty');
 
   const CATEGORY_ORDER = ['financial_aid_overview','scholarships','amounts','deadlines','how_to_apply','notes'];
   const CATEGORY_LABELS = {
@@ -700,7 +773,9 @@ INDEX_HTML = """<!DOCTYPE html>
   let latencyPoints = [];
   let progressPoints = [];
   let hitMissPoints = [];        // parallel to progressPoints: true = sentence yielded a fact
-  let sentenceHistory = [];      // {index, context, contributedKeys, chunkPreview}
+  let sentenceHistory = [];      // {index, context, contributedKeys, chunkPreview, text}
+  let extractionRecords = [];    // {key, context, url, sentences[], items[], firstIndex, lastIndex}
+  let candidateUrl = '';
   const MAX_VISIBLE_NODES = 9;
 
   function buildLegend(){
@@ -716,11 +791,13 @@ INDEX_HTML = """<!DOCTYPE html>
   buildLegend();
 
   function logRow(text){
-    const row = document.createElement('div');
-    row.className = 'row';
-    row.textContent = text;
-    logEl.appendChild(row);
-    logEl.scrollTop = logEl.scrollHeight;
+    [logEl, logTableEl].forEach(function(target){
+      const row = document.createElement('div');
+      row.className = 'row';
+      row.textContent = text;
+      target.appendChild(row);
+      target.scrollTop = target.scrollHeight;
+    });
   }
 
   function setBanner(kind, text){
@@ -820,10 +897,10 @@ INDEX_HTML = """<!DOCTYPE html>
     const k = keys[0];
     let v = delta[k];
     let first = Array.isArray(v) ? v[0] : v;
-    let text = typeof first === 'string' ? first : JSON.stringify(first);
-    text = (text || '').trim();
-    if (text.length > 46) text = text.slice(0, 43) + '…';
-    return { key: k, text: text || '(added)' };
+    let full = typeof first === 'string' ? first : JSON.stringify(first);
+    full = (full || '').trim() || '(added)';
+    const text = full.length > 40 ? full.slice(0, 37) + '…' : full;
+    return { key: k, text: text, full: full };
   }
 
   function addExtractedBox(index, chunk){
@@ -832,6 +909,7 @@ INDEX_HTML = """<!DOCTYPE html>
     const box = document.createElement('div');
     box.className = 'extracted-box';
     box.style.borderColor = color;
+    box.title = (CATEGORY_LABELS[chunk.key] || chunk.key) + ': ' + chunk.full;
     box.innerHTML =
       '<div class="exb-head" style="color:' + color + '">' + svgEsc(CATEGORY_LABELS[chunk.key] || chunk.key) +
       '<span class="exb-idx">S' + (index+1) + '</span></div>' +
@@ -839,6 +917,79 @@ INDEX_HTML = """<!DOCTYPE html>
     extractedBoxes.appendChild(box);
     extractedCount.textContent = '(' + extractedBoxes.children.length + ')';
     extractedBoxes.scrollTop = extractedBoxes.scrollHeight;
+  }
+
+  // -- Data extrapolation table: which sentence(s) fed which extracted fact --
+  function updateExtractionRecords(entry, delta){
+    const keys = computeContributedKeys(delta);
+    if (!keys.length) return;
+    const primaryKey = keys[0];
+    const items = [];
+    keys.forEach(k => {
+      const v = delta[k];
+      const arr = Array.isArray(v) ? v : [v];
+      arr.forEach(item => {
+        const text = typeof item === 'string' ? item : JSON.stringify(item);
+        if (text && text.trim()) items.push({ key: k, text: text.trim() });
+      });
+    });
+
+    const last = extractionRecords[extractionRecords.length - 1];
+    // consecutive sentences landing in the same category get merged into one
+    // row -- that's the "took 3 sentences to get one piece of info" case.
+    if (last && last.key === primaryKey && entry.index === last.lastIndex + 1){
+      last.sentences.push(entry.text || '(sentence ' + (entry.index+1) + ')');
+      last.items = last.items.concat(items);
+      last.lastIndex = entry.index;
+    } else {
+      extractionRecords.push({
+        key: primaryKey,
+        context: entry.context,
+        url: candidateUrl,
+        sentences: [entry.text || '(sentence ' + (entry.index+1) + ')'],
+        items: items,
+        firstIndex: entry.index,
+        lastIndex: entry.index,
+      });
+    }
+    renderExtrapolationTable();
+  }
+
+  function renderExtrapolationTable(){
+    if (!extractionRecords.length){
+      extrapolationBody.innerHTML = '<tr><td colspan="3" class="empty" id="extrapolationEmpty">Nothing extrapolated yet.</td></tr>';
+      extrapolationEmpty = el('extrapolationEmpty');
+      return;
+    }
+    if (extrapolationEmpty){ extrapolationEmpty = null; }
+
+    const rows = extractionRecords.map(rec => {
+      const catColor = CATEGORY_COLORS[rec.key] || '#191919';
+      const ctxKind = contextKind(rec.context);
+      const ctxColor = CONTEXT_COLORS[ctxKind] || '#5c5c5c';
+      const label = rec.sentences.length > 1
+        ? 'S' + (rec.firstIndex+1) + '–S' + (rec.lastIndex+1) + ' (' + rec.sentences.length + ' sentences)'
+        : 'S' + (rec.firstIndex+1);
+
+      const col1 = '<div style="font-size:10.5px;color:var(--muted);margin-bottom:4px;">' + svgEsc(label) + '</div>' +
+        svgEsc(rec.sentences.join(' '));
+
+      const col2 =
+        '<span class="extrap-pill" style="background:' + ctxColor + '19;color:' + ctxColor + ';border:1px solid ' + ctxColor + '55;">prompt: ' + svgEsc(CONTEXT_LABELS[ctxKind] || ctxKind) + ' sentence</span>' +
+        '<span class="extrap-pill" style="background:' + catColor + '19;color:' + catColor + ';border:1px solid ' + catColor + '55;">tag: ' + svgEsc(CATEGORY_LABELS[rec.key] || rec.key) + '</span>' +
+        (rec.url ? '<span class="extrap-url">' + svgEsc(rec.url) + '</span>' : '');
+
+      const uniqueItems = [];
+      const seen = new Set();
+      rec.items.forEach(it => { if (!seen.has(it.text)){ seen.add(it.text); uniqueItems.push(it); } });
+      const col3 = '<ul class="extrap-list">' + uniqueItems.map(it =>
+        '<li><span class="extrap-icon" style="color:' + (CATEGORY_COLORS[it.key] || '#191919') + ';">&rsaquo;</span><span class="extrap-item-text">' + svgEsc(it.text) + '</span></li>'
+      ).join('') + '</ul>';
+
+      return '<tr><td>' + col1 + '</td><td>' + col2 + '</td><td>' + col3 + '</td></tr>';
+    });
+
+    extrapolationBody.innerHTML = rows.join('');
   }
 
   function renderGraph(){
@@ -905,14 +1056,21 @@ INDEX_HTML = """<!DOCTYPE html>
     });
 
     // extracted-data chunk nodes (far left, new) -- only sentences that hit
+    // text is clipped to the box, full content shown via native tooltip on hover
     visible.forEach((s, i) => {
       if (!s.chunkPreview) return;
       const sy = sentGap * (i+1);
       const color = CATEGORY_COLORS[s.chunkPreview.key] || '#999';
+      const clipId = 'clip-chunk-' + s.index;
+      const tooltip = (CATEGORY_LABELS[s.chunkPreview.key] || '') + ': ' + s.chunkPreview.full;
       parts.push(
-        '<rect x="' + chunkX + '" y="' + (sy-15) + '" width="' + chunkW + '" height="30" rx="8" fill="#fbfbfb" stroke="' + color + '" stroke-width="1.4"/>' +
-        '<text x="' + (chunkX+8) + '" y="' + (sy-2) + '" font-size="8.5" fill="' + color + '" font-weight="600">' + svgEsc(CATEGORY_LABELS[s.chunkPreview.key] || '') + '</text>' +
-        '<text x="' + (chunkX+8) + '" y="' + (sy+9) + '" font-size="8.5" fill="#555">' + svgEsc(s.chunkPreview.text) + '</text>'
+        '<clipPath id="' + clipId + '"><rect x="' + (chunkX+6) + '" y="' + (sy-13) + '" width="' + (chunkW-12) + '" height="26"/></clipPath>' +
+        '<g>' +
+          '<title>' + svgEsc(tooltip) + '</title>' +
+          '<rect x="' + chunkX + '" y="' + (sy-15) + '" width="' + chunkW + '" height="30" rx="8" fill="#fbfbfb" stroke="' + color + '" stroke-width="1.4"/>' +
+          '<text clip-path="url(#' + clipId + ')" x="' + (chunkX+8) + '" y="' + (sy-2) + '" font-size="8.5" fill="' + color + '" font-weight="700">' + svgEsc(CATEGORY_LABELS[s.chunkPreview.key] || '') + '</text>' +
+          '<text clip-path="url(#' + clipId + ')" x="' + (chunkX+8) + '" y="' + (sy+9) + '" font-size="8.5" fill="#555">' + svgEsc(s.chunkPreview.text) + '</text>' +
+        '</g>'
       );
     });
 
@@ -954,12 +1112,17 @@ INDEX_HTML = """<!DOCTYPE html>
     sentenceText.classList.add('empty');
     sentenceMeta.textContent = '';
     progressBar.value = 0; progressBar.max = 1;
+    promptView.textContent = '—';
+    promptView.classList.add('empty');
     knowledgeView.textContent = '{}';
-    logEl.innerHTML = '';
+    logEl.innerHTML = ''; logTableEl.innerHTML = '';
     latencyPoints = []; progressPoints = []; hitMissPoints = []; sentenceHistory = [];
+    extractionRecords = []; candidateUrl = '';
     extractedBoxes.innerHTML = '<div class="empty" id="extractedEmpty">Nothing extracted yet — a box appears here every time a sentence yields a useful fact.</div>';
     extractedEmpty = el('extractedEmpty');
     extractedCount.textContent = '';
+    extrapolationBody.innerHTML = '<tr><td colspan="3" class="empty" id="extrapolationEmpty">Nothing extrapolated yet.</td></tr>';
+    extrapolationEmpty = el('extrapolationEmpty');
     redrawCharts(); renderGraph();
   }
 
@@ -1018,6 +1181,7 @@ INDEX_HTML = """<!DOCTYPE html>
       case 'candidate_found':
         crawlBody.textContent = 'Candidate financial-aid page: ' + evt.url;
         logRow('[' + evt.ts + '] candidate page -> ' + evt.url);
+        candidateUrl = evt.url;
         break;
       case 'page_extracted':
         crawlBody.textContent = 'Extracted ' + evt.item_count + ' sentence(s) from ' + evt.url;
@@ -1030,7 +1194,11 @@ INDEX_HTML = """<!DOCTYPE html>
         sentenceText.textContent = evt.text;
         sentenceText.classList.remove('empty');
         sentenceMeta.textContent = 'sentence ' + (evt.index+1) + ' / ' + evt.total + ' — asking qwen…';
-        sentenceHistory.push({index: evt.index, context: evt.context, contributedKeys: []});
+        if (evt.prompt){
+          promptView.textContent = evt.prompt;
+          promptView.classList.remove('empty');
+        }
+        sentenceHistory.push({index: evt.index, context: evt.context, contributedKeys: [], text: evt.text, prompt: evt.prompt});
         renderGraph();
         break;
       }
@@ -1053,7 +1221,10 @@ INDEX_HTML = """<!DOCTYPE html>
         redrawCharts();
         renderGraph();
 
-        if (entry.chunkPreview) addExtractedBox(evt.index, entry.chunkPreview);
+        if (entry.chunkPreview){
+          addExtractedBox(evt.index, entry.chunkPreview);
+          updateExtractionRecords(entry, evt.delta);
+        }
         break;
       }
       case 'run_done':
