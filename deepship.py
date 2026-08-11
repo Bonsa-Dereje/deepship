@@ -456,6 +456,9 @@ INDEX_HTML = """<!DOCTYPE html>
     --text:#191919; --muted:#8a8a8a; --muted-strong:#5c5c5c; --accent:#191919;
     --pill-bg:#f2f2f2; --error:#b3261e; --error-bg:#fbeceb;
     --good:#1a7f37; --good-bg:#e9f7ee;
+    --c-bullet:#1d4ed8; --c-heading:#b35c00; --c-paragraph:#5c5c5c;
+    --c-financial_aid_overview:#2563eb; --c-scholarships:#7c3aed; --c-amounts:#059669;
+    --c-deadlines:#dc2626; --c-how_to_apply:#d97706; --c-notes:#64748b;
     --font:-apple-system,BlinkMacSystemFont,"SF Pro Text","Helvetica Neue",Arial,sans-serif;
     --mono:"SF Mono", ui-monospace, Menlo, Consolas, monospace;
   }
@@ -471,7 +474,7 @@ INDEX_HTML = """<!DOCTYPE html>
   .brand .status-text{font-size:11.5px;color:var(--muted);margin-top:1px;}
 
   .sitebox{
-    max-width:960px;margin:20px auto 0;padding:0 24px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;
+    max-width:1400px;margin:20px auto 0;padding:0 24px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;
   }
   .sitebox label{font-size:12.5px;color:var(--muted);margin-right:2px;}
   .sitebox input{
@@ -489,9 +492,17 @@ INDEX_HTML = """<!DOCTYPE html>
   button.primary:hover:not(:disabled){opacity:.85;}
   button:disabled{cursor:not-allowed;opacity:.45;}
 
-  main{max-width:960px;margin:0 auto;padding:20px 24px 60px;display:flex;flex-direction:column;gap:16px;}
+  #banner{max-width:1400px;margin:12px auto 0;padding:0 24px;}
+
+  .twocol{
+    max-width:1400px;margin:0 auto;padding:16px 24px 60px;
+    display:grid;grid-template-columns:1fr 1fr;gap:20px;align-items:start;
+  }
+  .col{display:flex;flex-direction:column;gap:16px;}
+  @media (max-width:980px){.twocol{grid-template-columns:1fr;}}
+
   .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;}
-  @media (max-width:760px){.grid{grid-template-columns:1fr;}}
+  @media (max-width:640px){.grid{grid-template-columns:1fr;}}
 
   .card{border:1px solid var(--border);border-radius:12px;padding:16px 18px;background:var(--panel);}
   .card h2{font-size:12.5px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;
@@ -502,9 +513,9 @@ INDEX_HTML = """<!DOCTYPE html>
     display:inline-block;font-size:11px;padding:3px 9px;border-radius:999px;background:var(--pill-bg);
     color:var(--muted-strong);margin-bottom:8px;
   }
-  .pill.bullet{background:#eef3ff;color:#1d4ed8;}
-  .pill.heading{background:#fff3e0;color:#b35c00;}
-  .pill.paragraph{background:#f2f2f2;color:#5c5c5c;}
+  .pill.bullet{background:#eef3ff;color:var(--c-bullet);}
+  .pill.heading{background:#fff3e0;color:var(--c-heading);}
+  .pill.paragraph{background:#f2f2f2;color:var(--c-paragraph);}
 
   #sentenceText{font-size:14.5px;line-height:1.55;margin:4px 0 8px;}
   #sentenceMeta{font-size:11.5px;color:var(--muted);}
@@ -529,6 +540,23 @@ INDEX_HTML = """<!DOCTYPE html>
   #log{font-family:var(--mono);font-size:11.5px;line-height:1.7;color:var(--muted-strong);
     max-height:200px;overflow-y:auto;}
   #log .row{white-space:pre-wrap;word-break:break-word;}
+
+  /* -- right column: site preview + node graph -- */
+  #previewFrame{
+    width:100%;height:230px;border:1px solid var(--border);border-radius:8px;background:#fafafa;
+  }
+  #previewNote{font-size:11px;color:var(--muted);margin-top:6px;}
+  #previewUrl{font-family:var(--mono);font-size:11px;color:var(--muted-strong);margin-top:4px;
+    word-break:break-all;}
+
+  .legend{display:flex;flex-wrap:wrap;gap:10px;margin-top:10px;font-size:11px;color:var(--muted-strong);}
+  .legend .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:5px;vertical-align:middle;}
+  .legend .item{display:flex;align-items:center;}
+
+  #graphCard{flex:1;}
+  #graphWrap{width:100%;height:520px;}
+  #nodeGraph{width:100%;height:100%;display:block;}
+  #nodeGraph text{font-family:var(--font);}
 </style>
 </head>
 <body>
@@ -550,42 +578,63 @@ INDEX_HTML = """<!DOCTYPE html>
   <button id="stopBtn" disabled>Stop</button>
 </div>
 
-<main>
-  <div id="banner"></div>
+<div id="banner"></div>
 
-  <div class="card">
-    <h2>Crawl</h2>
-    <div id="crawlBody" class="empty">Nothing yet — enter a site and hit Start.</div>
-    <div class="links-sample" id="linksSample"></div>
-  </div>
+<div class="twocol">
 
-  <div class="grid">
+  <!-- LEFT: everything the dashboard already showed -->
+  <div class="col">
     <div class="card">
-      <h2>Current sentence</h2>
-      <div id="contextPill"></div>
-      <div id="sentenceText" class="empty">—</div>
-      <div id="sentenceMeta"></div>
-      <progress id="progressBar" value="0" max="1"></progress>
+      <h2>Crawl</h2>
+      <div id="crawlBody" class="empty">Nothing yet — enter a site and hit Start.</div>
+      <div class="links-sample" id="linksSample"></div>
     </div>
+
+    <div class="grid">
+      <div class="card">
+        <h2>Current sentence</h2>
+        <div id="contextPill"></div>
+        <div id="sentenceText" class="empty">—</div>
+        <div id="sentenceMeta"></div>
+        <progress id="progressBar" value="0" max="1"></progress>
+      </div>
+      <div class="card">
+        <h2>Model round-trips</h2>
+        <div class="chart-label">latency per request (s)</div>
+        <canvas id="latencyChart" width="420" height="90"></canvas>
+        <div class="chart-label" style="margin-top:10px;">sentences processed / total</div>
+        <canvas id="progressChart" width="420" height="90"></canvas>
+      </div>
+    </div>
+
     <div class="card">
-      <h2>Model round-trips</h2>
-      <div class="chart-label">latency per request (s)</div>
-      <canvas id="latencyChart" width="420" height="90"></canvas>
-      <div class="chart-label" style="margin-top:10px;">sentences processed / total</div>
-      <canvas id="progressChart" width="420" height="90"></canvas>
+      <h2>Knowledge so far <span style="color:var(--muted);font-weight:400;">(re-sent, trimmed, on every request — grown, never lost, here)</span></h2>
+      <pre id="knowledgeView" class="empty">{}</pre>
+    </div>
+
+    <div class="card">
+      <h2>Event log</h2>
+      <div id="log"></div>
     </div>
   </div>
 
-  <div class="card">
-    <h2>Knowledge so far <span style="color:var(--muted);font-weight:400;">(re-sent, trimmed, on every request — grown, never lost, here)</span></h2>
-    <pre id="knowledgeView" class="empty">{}</pre>
+  <!-- RIGHT: the site itself, and a node graph of which sentence fed which fact -->
+  <div class="col">
+    <div class="card">
+      <h2>Site preview <span id="previewWhich" style="color:var(--muted);font-weight:400;text-transform:none;"></span></h2>
+      <iframe id="previewFrame" src="about:blank"></iframe>
+      <div id="previewUrl"></div>
+      <div id="previewNote">Some sites block being embedded here — open the link directly if this stays blank.</div>
+    </div>
+
+    <div class="card" id="graphCard">
+      <h2>Sentence → knowledge graph</h2>
+      <div id="graphWrap"><svg id="nodeGraph" viewBox="0 0 480 520"></svg></div>
+      <div class="legend" id="legend"></div>
+    </div>
   </div>
 
-  <div class="card">
-    <h2>Event log</h2>
-    <div id="log"></div>
-  </div>
-</main>
+</div>
 
 <script>
 (function(){
@@ -596,9 +645,37 @@ INDEX_HTML = """<!DOCTYPE html>
   const contextPill = el('contextPill'), sentenceText = el('sentenceText'), sentenceMeta = el('sentenceMeta');
   const progressBar = el('progressBar'), knowledgeView = el('knowledgeView'), logEl = el('log');
   const latencyCanvas = el('latencyChart'), progressCanvas = el('progressChart');
+  const previewFrame = el('previewFrame'), previewUrl = el('previewUrl'), previewWhich = el('previewWhich');
+  const nodeGraph = el('nodeGraph'), legendEl = el('legend');
+
+  const CATEGORY_ORDER = ['financial_aid_overview','scholarships','amounts','deadlines','how_to_apply','notes'];
+  const CATEGORY_LABELS = {
+    financial_aid_overview: 'Aid overview', scholarships: 'Scholarships', amounts: 'Amounts',
+    deadlines: 'Deadlines', how_to_apply: 'How to apply', notes: 'Notes'
+  };
+  const CATEGORY_COLORS = {
+    financial_aid_overview: '#2563eb', scholarships: '#7c3aed', amounts: '#059669',
+    deadlines: '#dc2626', how_to_apply: '#d97706', notes: '#64748b'
+  };
+  const CONTEXT_COLORS = { bullet: '#1d4ed8', heading: '#b35c00', paragraph: '#5c5c5c' };
+  const CONTEXT_LABELS = { bullet: 'bullet point', heading: 'heading', paragraph: 'paragraph' };
 
   let latencyPoints = [];
-  let progressPoints = []; // fraction 0..1 over time
+  let progressPoints = [];
+  let sentenceHistory = [];      // {index, context, contributedKeys}
+  const MAX_VISIBLE_NODES = 9;
+
+  function buildLegend(){
+    let parts = [];
+    Object.keys(CONTEXT_COLORS).forEach(k => {
+      parts.push('<span class="item"><span class="dot" style="background:' + CONTEXT_COLORS[k] + '"></span>' + CONTEXT_LABELS[k] + '</span>');
+    });
+    CATEGORY_ORDER.forEach(k => {
+      parts.push('<span class="item"><span class="dot" style="background:' + CATEGORY_COLORS[k] + '"></span>' + CATEGORY_LABELS[k] + '</span>');
+    });
+    legendEl.innerHTML = parts.join('');
+  }
+  buildLegend();
 
   function logRow(text){
     const row = document.createElement('div');
@@ -613,12 +690,14 @@ INDEX_HTML = """<!DOCTYPE html>
     banner.innerHTML = '<div class="msg-' + kind + '">' + text + '</div>';
   }
 
-  function pillClass(context){
+  function contextKind(context){
     if (!context) return 'paragraph';
     if (context.indexOf('bullet') === 0) return 'bullet';
     if (context === 'heading') return 'heading';
     return 'paragraph';
   }
+
+  function pillClass(context){ return contextKind(context); }
 
   function drawLine(canvas, values, color){
     const ctx = canvas.getContext('2d');
@@ -649,6 +728,84 @@ INDEX_HTML = """<!DOCTYPE html>
     drawLine(progressCanvas, progressPoints, '#1d4ed8');
   }
 
+  function computeContributedKeys(delta){
+    if (!delta) return [];
+    return Object.keys(delta).filter(k => {
+      const v = delta[k];
+      if (Array.isArray(v)) return v.length > 0;
+      if (typeof v === 'string') return v.trim().length > 0;
+      return !!v;
+    }).filter(k => CATEGORY_COLORS[k]);
+  }
+
+  function svgEsc(s){
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }
+
+  function renderGraph(){
+    const W = 480, H = 520;
+    const catX = W - 128;
+    const catGap = H / (CATEGORY_ORDER.length + 1);
+    const catPos = {};
+    CATEGORY_ORDER.forEach((cat, i) => { catPos[cat] = { x: catX, y: catGap * (i+1) }; });
+
+    const visible = sentenceHistory.slice(-MAX_VISIBLE_NODES);
+    const sentX = 24;
+    const sentGap = H / (MAX_VISIBLE_NODES + 1);
+
+    let parts = [];
+
+    // wires (drawn first, under the nodes)
+    visible.forEach((s, i) => {
+      const sy = sentGap * (i+1);
+      (s.contributedKeys || []).forEach(key => {
+        const cp = catPos[key];
+        if (!cp) return;
+        const x1 = sentX + 92, y1 = sy, x2 = cp.x, y2 = cp.y;
+        const mx = (x1+x2)/2;
+        const d = 'M ' + x1 + ' ' + y1 + ' C ' + mx + ' ' + y1 + ', ' + mx + ' ' + y2 + ', ' + x2 + ' ' + y2;
+        parts.push('<path d="' + d + '" fill="none" stroke="' + CATEGORY_COLORS[key] + '" stroke-width="1.6" opacity="0.55"/>');
+      });
+    });
+
+    // category nodes (right side)
+    CATEGORY_ORDER.forEach(cat => {
+      const p = catPos[cat], color = CATEGORY_COLORS[cat];
+      parts.push(
+        '<rect x="' + p.x + '" y="' + (p.y-14) + '" width="118" height="28" rx="8" fill="#ffffff" stroke="' + color + '" stroke-width="1.6"/>' +
+        '<circle cx="' + p.x + '" cy="' + p.y + '" r="4" fill="' + color + '"/>' +
+        '<text x="' + (p.x+12) + '" y="' + (p.y+4) + '" font-size="11" fill="' + color + '">' + svgEsc(CATEGORY_LABELS[cat]) + '</text>'
+      );
+    });
+
+    // sentence nodes (left side)
+    visible.forEach((s, i) => {
+      const sy = sentGap * (i+1);
+      const kind = contextKind(s.context);
+      const color = CONTEXT_COLORS[kind];
+      const hasDelta = (s.contributedKeys || []).length > 0;
+      parts.push(
+        '<circle cx="' + (sentX+92) + '" cy="' + sy + '" r="4" fill="' + color + '"/>' +
+        '<rect x="' + sentX + '" y="' + (sy-14) + '" width="92" height="28" rx="8" fill="#ffffff" stroke="' + color +
+          '" stroke-width="' + (hasDelta ? 1.8 : 1) + '" opacity="' + (hasDelta ? 1 : 0.55) + '"/>' +
+        '<text x="' + (sentX+8) + '" y="' + (sy+4) + '" font-size="10" fill="' + color + '">S' + (s.index+1) + ' · ' + svgEsc(kind) + '</text>'
+      );
+    });
+
+    nodeGraph.innerHTML = parts.join('');
+  }
+
+  function renderKnowledgeHTML(knowledge){
+    let text = JSON.stringify(knowledge, null, 2);
+    text = svgEsc(text);
+    CATEGORY_ORDER.forEach(key => {
+      const color = CATEGORY_COLORS[key];
+      text = text.replace(new RegExp('"' + key + '"', 'g'),
+        '<span style="color:' + color + ';font-weight:600;">"' + key + '"</span>');
+    });
+    return text;
+  }
+
   async function pollStatus(){
     try{
       const r = await fetch('/api/status');
@@ -675,8 +832,9 @@ INDEX_HTML = """<!DOCTYPE html>
     progressBar.value = 0; progressBar.max = 1;
     knowledgeView.textContent = '{}';
     logEl.innerHTML = '';
-    latencyPoints = []; progressPoints = [];
-    redrawCharts();
+    latencyPoints = []; progressPoints = []; sentenceHistory = [];
+    previewFrame.src = 'about:blank'; previewUrl.textContent = ''; previewWhich.textContent = '';
+    redrawCharts(); renderGraph();
   }
 
   startBtn.addEventListener('click', async () => {
@@ -715,9 +873,12 @@ INDEX_HTML = """<!DOCTYPE html>
 
   function handleEvent(evt){
     switch(evt.event){
-      case 'crawl_start':
+      case 'crawl_start': {
         logRow('[' + evt.ts + '] crawling ' + evt.site);
+        const url = evt.site.indexOf('http') === 0 ? evt.site : ('https://' + evt.site);
+        previewFrame.src = url; previewUrl.textContent = url; previewWhich.textContent = '(homepage)';
         break;
+      }
       case 'crawl_done':
         crawlBody.textContent = evt.link_count + ' link(s) found on the homepage.';
         linksSample.textContent = (evt.sample || []).join('\\n');
@@ -729,6 +890,7 @@ INDEX_HTML = """<!DOCTYPE html>
       case 'candidate_found':
         crawlBody.textContent = 'Candidate financial-aid page: ' + evt.url;
         logRow('[' + evt.ts + '] candidate page -> ' + evt.url);
+        previewFrame.src = evt.url; previewUrl.textContent = evt.url; previewWhich.textContent = '(candidate finaid page)';
         break;
       case 'page_extracted':
         crawlBody.textContent = 'Extracted ' + evt.item_count + ' sentence(s) from ' + evt.url;
@@ -741,17 +903,25 @@ INDEX_HTML = """<!DOCTYPE html>
         sentenceText.textContent = evt.text;
         sentenceText.classList.remove('empty');
         sentenceMeta.textContent = 'sentence ' + (evt.index+1) + ' / ' + evt.total + ' — asking qwen…';
+        sentenceHistory.push({index: evt.index, context: evt.context, contributedKeys: []});
+        renderGraph();
         break;
       }
       case 'sentence_done': {
         sentenceMeta.textContent = 'sentence ' + (evt.index+1) + ' / ' + evt.total +
           ' — ' + evt.elapsed + 's round-trip';
         progressBar.value = evt.index + 1;
-        knowledgeView.textContent = JSON.stringify(evt.knowledge, null, 2);
+        knowledgeView.innerHTML = renderKnowledgeHTML(evt.knowledge);
         knowledgeView.classList.remove('empty');
         latencyPoints.push(evt.elapsed);
         progressPoints.push((evt.index+1) / evt.total);
         redrawCharts();
+
+        const keys = computeContributedKeys(evt.delta);
+        let entry = sentenceHistory.find(s => s.index === evt.index);
+        if (!entry){ entry = {index: evt.index, context: evt.context}; sentenceHistory.push(entry); }
+        entry.contributedKeys = keys;
+        renderGraph();
         break;
       }
       case 'run_done':
@@ -771,6 +941,8 @@ INDEX_HTML = """<!DOCTYPE html>
         break;
     }
   }
+
+  renderGraph();
 })();
 </script>
 </body>
