@@ -375,50 +375,75 @@ def ask_qwen_compare_detail(messages, section="snipe", model=None):
 
 def rank_block_hits_by_detail(block_hits, context_tag, section, model, block_index, blocks_total):
     """Mutates each dict in block_hits in place, adding "detail_grade" (0 ..
-    N-1) and "detail_max" (N-1). Publishes 'detail_compare_*' events for each
-    consecutive pair checked, then one 'para_ranked' event with the full
-    grading and the single highest-detail ("number one") sentence."""
+    N-1) and "detail_max" (N-1).
+
+    Runs a "running champion" tournament, one round at a time:
+      - Round starts with every not-yet-graded sentence still in the pool,
+        in the order they appear in the paragraph.
+      - The first sentence in the pool is the "champion". It's compared
+        (the "WHICH" node) against the next sentence in the pool; whichever
+        the model says has more detail becomes/stays the champion, and the
+        loser is dropped for the rest of THIS round -- the node loops back
+        and the champion is compared against the next sentence down the
+        list, one by one, until the pool is exhausted.
+      - Whoever is champion at the end of the round gets the next grade
+        down from the top (first round winner = N-1, i.e. "number one").
+      - That winner is removed from the pool and the whole thing iterates
+        again on what's left, until one sentence remains (which
+        automatically gets grade 0).
+    """
     n = len(block_hits)
     if n == 0:
         return
-    if n == 1:
-        block_hits[0]["detail_grade"] = 0
-        block_hits[0]["detail_max"] = 0
-        top = block_hits[0]
-        bus.publish("para_ranked", section=section, index=block_index, total=blocks_total, count=1,
-                    ranked=[{"sentence": top["sentence"], "grade": 0, "category": top["category"],
-                             "start": top.get("start"), "end": top.get("end")}],
-                    top={"sentence": top["sentence"], "grade": 0, "category": top["category"],
-                         "start": top.get("start"), "end": top.get("end")})
-        return
 
-    scores = [0] * n
-    for i in range(n - 1):
-        a, b = block_hits[i], block_hits[i + 1]
-        messages = build_detail_compare_messages(a["sentence"], b["sentence"], context_tag)
-        bus.publish("detail_compare_start", section=section, index=block_index, total=blocks_total,
-                    pair_index=i, pair_total=n - 1, sentence_a=a["sentence"], sentence_b=b["sentence"])
-        winner, reason, elapsed, raw = ask_qwen_compare_detail(messages, section=section, model=model)
-        if winner == "A":
-            scores[i] += 1
-        else:
-            scores[i + 1] += 1
-        bus.publish("detail_compare_done", section=section, index=block_index, total=blocks_total,
-                    pair_index=i, pair_total=n - 1, winner=winner, reason=reason, elapsed=round(elapsed, 2),
-                    sentence_a=a["sentence"], sentence_b=b["sentence"])
+    remaining = list(range(n))  # indices into block_hits, still in the running
+    next_grade = n - 1          # first round winner gets the highest grade
+    round_num = 0
 
-    # Stable sort ascending by win-count: ties keep their original order in
-    # the paragraph, so the earlier-appearing sentence of a tied pair grades
-    # slightly lower. Position in this order IS the grade (0 .. n-1).
-    order = sorted(range(n), key=lambda idx: scores[idx])
-    for grade, idx in enumerate(order):
-        block_hits[idx]["detail_grade"] = grade
-        block_hits[idx]["detail_max"] = n - 1
+    while remaining:
+        if len(remaining) == 1:
+            idx = remaining[0]
+            block_hits[idx]["detail_grade"] = next_grade
+            block_hits[idx]["detail_max"] = n - 1
+            bus.publish("detail_round_winner", section=section, index=block_index, total=blocks_total,
+                        round=round_num, winner_idx=idx, sentence=block_hits[idx]["sentence"],
+                        grade=next_grade, remaining_count=0)
+            break
+
+        bus.publish("detail_round_start", section=section, index=block_index, total=blocks_total,
+                    round=round_num,
+                    pool=[{"idx": k, "sentence": block_hits[k]["sentence"]} for k in remaining])
+
+        champion = remaining[0]
+        for challenger in remaining[1:]:
+            a, b = block_hits[champion], block_hits[challenger]
+            messages = build_detail_compare_messages(a["sentence"], b["sentence"], context_tag)
+            bus.publish("detail_bout_start", section=section, index=block_index, total=blocks_total,
+                        round=round_num, champion_idx=champion, challenger_idx=challenger,
+                        sentence_a=a["sentence"], sentence_b=b["sentence"])
+
+            winner, reason, elapsed, raw = ask_qwen_compare_detail(messages, section=section, model=model)
+            winner_idx = champion if winner == "A" else challenger
+            loser_idx = challenger if winner_idx == champion else champion
+
+            bus.publish("detail_bout_done", section=section, index=block_index, total=blocks_total,
+                        round=round_num, champion_idx=champion, challenger_idx=challenger,
+                        winner_idx=winner_idx, loser_idx=loser_idx, reason=reason, elapsed=round(elapsed, 2),
+                        sentence_a=a["sentence"], sentence_b=b["sentence"])
+            champion = winner_idx
+
+        block_hits[champion]["detail_grade"] = next_grade
+        block_hits[champion]["detail_max"] = n - 1
+        remaining.remove(champion)
+        bus.publish("detail_round_winner", section=section, index=block_index, total=blocks_total,
+                    round=round_num, winner_idx=champion, sentence=block_hits[champion]["sentence"],
+                    grade=next_grade, remaining_count=len(remaining))
+        next_grade -= 1
+        round_num += 1
 
     ranked_payload = [{"sentence": h["sentence"], "grade": h["detail_grade"], "category": h["category"],
                         "start": h.get("start"), "end": h.get("end")} for h in block_hits]
-    top_idx = order[-1]
-    top = block_hits[top_idx]
+    top = max(block_hits, key=lambda h: h["detail_grade"])
     bus.publish("para_ranked", section=section, index=block_index, total=blocks_total, count=n,
                 ranked=ranked_payload,
                 top={"sentence": top["sentence"], "grade": top["detail_grade"], "category": top["category"],
@@ -785,6 +810,7 @@ INDEX_HTML = """<!DOCTYPE html>
     --c-hit-amount:#1d4ed8; --c-hit-amount-bg:#dfe9ff;
     --c-hit-both:#7c3aed; --c-hit-both-bg:#ede4fd;
     --detail:#b45309; --detail-bg:#fef3e2; --detail-border:#f3d19e;
+    --which:#334155; --which-bg:#eef1f5;
     --font:-apple-system,BlinkMacSystemFont,"SF Pro Text","Helvetica Neue",Arial,sans-serif;
     --mono:"SF Mono", ui-monospace, Menlo, Consolas, monospace;
   }
@@ -966,6 +992,91 @@ INDEX_HTML = """<!DOCTYPE html>
   .snipe-hit-card.cat-both .shc-head{color:#3b1a78;}
   .snipe-hit-card .shc-text{font-size:13px;line-height:1.5;color:var(--text);}
 
+  /* -- states applied to hit cards during the detail-ranking tournament -- */
+  .snipe-hit-card.eliminated{opacity:.35;filter:grayscale(75%);transition:opacity .2s,filter .2s;}
+  .snipe-hit-card.champion{box-shadow:0 0 0 2px var(--detail) inset;transition:box-shadow .15s;}
+  .snipe-hit-card.ranked{border-left-width:5px;border-left-color:var(--detail);}
+  .snipe-hit-card .shc-grade{color:var(--detail);font-weight:800;font-size:10.5px;margin-top:5px;text-transform:uppercase;letter-spacing:.03em;}
+
+  /* -- hit list is now full width; the node graph gets its own card below -- */
+  .sf-split{display:block;}
+
+  /* ================= node-graph canvas (DaVinci-style comparison graph) ================= */
+  .node-round-label{font-size:11.5px;color:var(--muted-strong);font-weight:600;line-height:1.5;margin-bottom:10px;}
+
+  .node-canvas{
+    position:relative;display:flex;align-items:stretch;gap:26px;
+    padding:22px 22px 26px;min-height:340px;border-radius:14px;overflow:hidden;
+    background:
+      radial-gradient(circle, rgba(255,255,255,.07) 1px, transparent 1.4px) 0 0/22px 22px,
+      linear-gradient(180deg,#1b1c22,#151519);
+    border:1px solid #2a2b33;
+  }
+  .node-canvas svg.node-wires{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;overflow:visible;}
+  .node-wires path.wire{fill:none;stroke:#53555f;stroke-width:2;stroke-linecap:round;
+    transition:stroke .2s,opacity .2s,d .35s ease;opacity:.6;}
+  .node-wires path.wire.live{stroke:#ffb454;opacity:1;filter:drop-shadow(0 0 4px rgba(255,180,84,.65));}
+  .node-wires path.wire.win{stroke:#3ddc84;opacity:1;filter:drop-shadow(0 0 4px rgba(61,220,132,.6));}
+  .node-wires path.wire.loop{stroke:#b592ff;stroke-width:2.4;stroke-dasharray:6 5;opacity:0;
+    filter:drop-shadow(0 0 4px rgba(181,146,255,.6));transition:opacity .25s,d .35s ease;}
+  .node-wires path.wire.loop.show{opacity:.95;}
+  .node-wires circle.port{fill:#4a4c56;stroke:#63656f;stroke-width:1;transition:fill .2s;}
+  .node-wires circle.port.live{fill:#ffb454;}
+  .node-wires circle.port.win{fill:#3ddc84;}
+
+  .node-col{position:relative;z-index:1;display:flex;flex-direction:column;min-width:0;}
+  .node-col-stack{flex:0 0 190px;}
+  .node-col-which{flex:0 0 200px;justify-content:center;}
+  .node-col-result{flex:0 0 190px;justify-content:center;}
+  .node-col-final{flex:1 1 auto;min-width:170px;}
+
+  .node-col-label{font-size:9.5px;font-weight:800;letter-spacing:.09em;text-transform:uppercase;
+    color:#7d7f8c;margin-bottom:10px;}
+
+  /* the pool: a physical stack of card-nodes, front card = current pick */
+  .node-stack-area{position:relative;flex:1;min-height:220px;}
+  .node-stack-empty{font-size:11.5px;color:#5c5e69;padding-top:6px;line-height:1.5;}
+  .stack-card{
+    position:absolute;left:0;right:10px;border-radius:9px;padding:8px 10px;
+    background:#26272e;border:1.4px solid #3a3c46;box-shadow:0 3px 8px rgba(0,0,0,.35);
+    transition:transform .3s ease,opacity .3s ease,border-color .2s,box-shadow .2s,left .3s,right .3s;
+    transform-origin:left center;
+  }
+  .stack-card .sc-tag{display:block;font-size:8.5px;font-weight:800;letter-spacing:.06em;text-transform:uppercase;
+    color:#8b8d99;margin-bottom:3px;}
+  .stack-card .sc-text{display:block;font-size:11.5px;line-height:1.4;color:#e7e7ec;
+    display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;}
+  .stack-card.pick{border-color:var(--detail);box-shadow:0 0 0 1.5px var(--detail) inset,0 4px 12px rgba(0,0,0,.4);}
+  .stack-card.pick .sc-tag{color:var(--detail);}
+  .stack-card.challenger{border-color:var(--which);}
+  .stack-card.challenger .sc-tag{color:var(--which);}
+  .stack-card.leaving{opacity:0!important;transform:translateX(-46px) rotate(-6deg) scale(.92)!important;}
+  .stack-card.winning-out{opacity:0!important;transform:translateX(340px) scale(.9)!important;}
+
+  /* WHICH / RESULT node boxes -- node-editor look, header bar + body */
+  .ngnode{border-radius:10px;background:#26272e;border:1.4px solid #3a3c46;
+    box-shadow:0 3px 10px rgba(0,0,0,.35);overflow:hidden;transition:box-shadow .2s,border-color .2s;}
+  .ngnode-head{font-size:9.5px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;
+    padding:7px 10px;color:#fff;}
+  .ngnode-body{padding:10px 11px 12px;font-size:12px;line-height:1.45;color:#dcdce2;min-height:44px;}
+  .ng-which .ngnode-head{background:#5b4a9e;}
+  .ng-which{transition:box-shadow .2s,border-color .2s;}
+  .ng-which.active{border-color:#ffb454;box-shadow:0 0 0 3px rgba(255,180,84,.28),0 3px 10px rgba(0,0,0,.35);}
+  .ng-which .ngnode-body{font-style:italic;color:#a9abb6;}
+  .ng-result .ngnode-head{background:#1c8752;}
+  .ng-result.filled{border-color:#3ddc84;}
+  .ng-result.filled .ngnode-body{color:#e7e7ec;font-style:normal;}
+  .ng-result .ngnode-body.empty-body{color:#5c5e69;font-style:italic;}
+
+  .node-final{font-size:11.5px;max-height:260px;overflow-y:auto;display:flex;flex-direction:column;gap:6px;
+    padding-right:2px;}
+  .node-final .nf-row{display:flex;gap:7px;align-items:baseline;padding:7px 9px;border-radius:8px;
+    background:#22232a;border:1px solid #34353e;animation:nfIn .25s ease;}
+  @keyframes nfIn{from{opacity:0;transform:translateX(8px);}to{opacity:1;transform:translateX(0);}}
+  .node-final .nf-grade{font-weight:800;color:var(--detail);flex-shrink:0;font-size:10.5px;}
+  .node-final .nf-text{color:#e7e7ec;line-height:1.4;}
+  .node-final .empty{color:#5c5e69;font-size:11.5px;}
+
   /* -- full-width sub-section: data extrapolation table (filter pass) -- */
   .extrap-wrap{overflow-x:auto;}
   table.extrap-table{width:100%;border-collapse:collapse;font-size:12.5px;}
@@ -1064,8 +1175,50 @@ INDEX_HTML = """<!DOCTYPE html>
 
   <div class="card" style="margin-bottom:16px;">
     <h3>Sentences found <span id="snipeHitCount" style="color:var(--muted);font-weight:400;"></span></h3>
-    <div class="snipe-hit-list" id="snipeHitList">
-      <div class="empty" id="snipeHitEmpty">Nothing found yet — a card appears here every time the model returns a matching sentence, verbatim.</div>
+    <div class="sf-split">
+      <div class="snipe-hit-list" id="snipeHitList">
+        <div class="empty" id="snipeHitEmpty">Nothing found yet — a card appears here every time the model returns a matching sentence, verbatim.</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-bottom:16px;">
+    <h3>Detail-ranking node graph</h3>
+    <div class="node-round-label" id="nodeRoundLabel">Once a paragraph's highlighted sentences are all found, they're stacked on the left and run through here to rank them by detail.</div>
+    <div class="node-canvas" id="nodeCanvas">
+      <svg class="node-wires" id="nodeWireSvg">
+        <path class="wire" id="wireChamp"></path>
+        <path class="wire" id="wireChall"></path>
+        <path class="wire" id="wireResult"></path>
+        <path class="wire loop" id="wireLoop"></path>
+        <circle class="port" id="portChampOut" r="4"></circle>
+        <circle class="port" id="portChallOut" r="4"></circle>
+        <circle class="port" id="portWhichOut" r="4"></circle>
+      </svg>
+      <div class="node-col node-col-stack">
+        <div class="node-col-label">Pool — stacked sentences</div>
+        <div class="node-stack-area" id="nodeStackArea">
+          <div class="node-stack-empty" id="nodeStackEmpty">Sentences found in this paragraph pile up here, waiting to be compared two at a time.</div>
+        </div>
+      </div>
+      <div class="node-col node-col-which">
+        <div class="node-col-label">Compare</div>
+        <div class="ngnode ng-which" id="nodeWhich">
+          <div class="ngnode-head">WHICH</div>
+          <div class="ngnode-body">has more detail?</div>
+        </div>
+      </div>
+      <div class="node-col node-col-result">
+        <div class="node-col-label">Winner</div>
+        <div class="ngnode ng-result" id="nodeResult">
+          <div class="ngnode-head">RESULT</div>
+          <div class="ngnode-body empty-body" id="nodeResultText">—</div>
+        </div>
+      </div>
+      <div class="node-col node-col-final">
+        <div class="node-col-label">Ranked so far</div>
+        <div class="node-final" id="nodeFinal"><span class="empty">Ranked sentences will be listed here, highest detail first, as each round finishes.</span></div>
+      </div>
     </div>
   </div>
 
@@ -1323,9 +1476,22 @@ INDEX_HTML = """<!DOCTYPE html>
     let hitEmpty = el('snipeHitEmpty');
     const logEl = el('snipeLog');
     const detailTop = el('snipeDetailTop');
+    const nodeRoundLabel = el('nodeRoundLabel');
+    const nodeCanvas = el('nodeCanvas'), nodeWireSvg = el('nodeWireSvg');
+    const nodeStackArea = el('nodeStackArea');
+    let nodeStackEmpty = el('nodeStackEmpty');
+    const nodeWhich = el('nodeWhich'), nodeResult = el('nodeResult'), nodeResultText = el('nodeResultText');
+    const nodeFinal = el('nodeFinal');
+    let nodeFinalEmpty = nodeFinal.querySelector('.empty');
+    const wireChamp = el('wireChamp'), wireChall = el('wireChall'), wireResult = el('wireResult'), wireLoop = el('wireLoop');
+    const portChampOut = el('portChampOut'), portChallOut = el('portChallOut'), portWhichOut = el('portWhichOut');
+    let blockHitLocalCount = 0; // resets each paragraph -- position of each hit within THIS paragraph's block_hits
 
     let currentParaText = '';
     let currentHighlights = []; // [{start,end,category}], filled in as sentences are checked
+
+    // -------- node graph state: the physical "pool" stack for the current round --------
+    let stackPool = []; // [{idx, sentence}], front (index 0) = current pick / champion
 
     function reset(){
       setBannerInto(banner, null, '');
@@ -1339,19 +1505,149 @@ INDEX_HTML = """<!DOCTYPE html>
       detailTop.innerHTML = '<span class="dtb-label">Most detailed sentence in this paragraph</span>' +
         '<span class="empty">Not enough highlighted sentences yet — appears once at least one is found and compared.</span>';
       currentParaText = ''; currentHighlights = [];
+      blockHitLocalCount = 0;
+      nodeRoundLabel.textContent = 'Once a paragraph\\'s highlighted sentences are all found, they\\'re stacked on the left and run through here to rank them by detail.';
+      resetNodeGraph();
+      nodeFinal.innerHTML = '<span class="empty">Ranked sentences will be listed here, highest detail first, as each round finishes.</span>';
+      nodeFinalEmpty = nodeFinal.querySelector('.empty');
       logEl.innerHTML = '';
       hitList.innerHTML = '<div class="empty" id="snipeHitEmpty">Nothing found yet — a card appears here every time a sentence comes back true for aid or amount.</div>';
       hitEmpty = el('snipeHitEmpty');
       hitCount.textContent = '';
     }
 
-    function addHitCard(index, context, sentence, category){
+    // ================= node graph rendering =================
+
+    function resetNodeGraph(){
+      stackPool = [];
+      renderStack();
+      setResult('—', false);
+      nodeWhich.classList.remove('active');
+      clearWireStates();
+      requestAnimationFrame(updateWires);
+    }
+
+    function setResult(text, filled){
+      nodeResultText.textContent = text;
+      nodeResultText.classList.toggle('empty-body', !filled);
+      nodeResult.classList.toggle('filled', filled);
+    }
+
+    function clearWireStates(){
+      [wireChamp, wireChall, wireResult].forEach(w => w.classList.remove('live', 'win'));
+      [portChampOut, portChallOut, portWhichOut].forEach(p => p.classList.remove('live', 'win'));
+      wireLoop.classList.remove('show');
+    }
+
+    // renders stackPool as a physical stack of cards, front card on top, offset+rotated going back
+    function renderStack(){
+      nodeStackArea.querySelectorAll('.stack-card').forEach(c => c.remove());
+      if (!stackPool.length){
+        if (!nodeStackEmpty){
+          nodeStackEmpty = document.createElement('div');
+          nodeStackEmpty.className = 'node-stack-empty';
+          nodeStackEmpty.id = 'nodeStackEmpty';
+          nodeStackEmpty.textContent = 'Sentences found in this paragraph pile up here, waiting to be compared two at a time.';
+          nodeStackArea.appendChild(nodeStackEmpty);
+        }
+        requestAnimationFrame(updateWires);
+        return;
+      }
+      if (nodeStackEmpty){ nodeStackEmpty.remove(); nodeStackEmpty = null; }
+      const shown = stackPool.slice(0, 6); // cap how many are drawn -- rest is implied depth
+      shown.forEach((item, i) => {
+        const card = document.createElement('div');
+        card.className = 'stack-card' + (i === 0 ? ' pick' : i === 1 ? ' challenger' : '');
+        card.dataset.stackIdx = String(i);
+        card.style.top = (i * 14) + 'px';
+        card.style.transform = 'translateX(' + (i * 4) + 'px) rotate(' + (i * -0.6) + 'deg)';
+        card.style.zIndex = String(shown.length - i);
+        card.style.opacity = String(Math.max(1 - i * 0.14, 0.35));
+        card.innerHTML = '<span class="sc-tag">' + (i === 0 ? 'current pick' : i === 1 ? 'next sentence' : 'in queue') +
+          '</span><span class="sc-text">' + svgEsc(item.sentence) + '</span>';
+        nodeStackArea.appendChild(card);
+      });
+      requestAnimationFrame(updateWires);
+    }
+
+    // computes an anchor point (relative to nodeCanvas) on the edge of an element
+    function anchor(elm, side){
+      const box = elm.getBoundingClientRect(), base = nodeCanvas.getBoundingClientRect();
+      const x = side === 'left' ? box.left : box.right;
+      const y = box.top + box.height / 2;
+      return { x: x - base.left, y: y - base.top };
+    }
+
+    function bezier(p1, p2){
+      const dx = Math.max(Math.abs(p2.x - p1.x) * 0.5, 40);
+      return 'M ' + p1.x + ' ' + p1.y +
+        ' C ' + (p1.x + dx) + ' ' + p1.y + ', ' + (p2.x - dx) + ' ' + p2.y + ', ' + p2.x + ' ' + p2.y;
+    }
+
+    function setPort(circleEl, pt){
+      circleEl.setAttribute('cx', pt.x); circleEl.setAttribute('cy', pt.y);
+    }
+
+    // redraws every wire from current DOM positions -- called after any layout change
+    function updateWires(){
+      const cards = nodeStackArea.querySelectorAll('.stack-card');
+      const pickCard = cards[0], challCard = cards[1];
+      const whichIn = anchor(nodeWhich, 'left'), whichOut = anchor(nodeWhich, 'right');
+      const resultIn = anchor(nodeResult, 'left');
+      const stackFallback = anchor(nodeStackArea, 'right');
+
+      const pickPt = pickCard ? { x: anchor(pickCard, 'right').x, y: anchor(pickCard, 'right').y } : stackFallback;
+      const challPt = challCard ? { x: anchor(challCard, 'right').x, y: anchor(challCard, 'right').y } : stackFallback;
+
+      wireChamp.setAttribute('d', bezier(pickPt, { x: whichIn.x, y: whichIn.y - 9 }));
+      wireChall.setAttribute('d', bezier(challPt, { x: whichIn.x, y: whichIn.y + 9 }));
+      wireResult.setAttribute('d', bezier(whichOut, resultIn));
+      setPort(portChampOut, pickPt);
+      setPort(portChallOut, challPt);
+      setPort(portWhichOut, whichOut);
+
+      // loop-back: big arc from bottom of RESULT, dips under the canvas, back to top of the stack
+      const resultBottom = { x: (anchor(nodeResult,'left').x + anchor(nodeResult,'right').x) / 2,
+                              y: nodeResult.getBoundingClientRect().bottom - nodeCanvas.getBoundingClientRect().top };
+      const stackTop = { x: anchor(nodeStackArea, 'left').x + 14, y: 10 };
+      const dipY = Math.max(resultBottom.y, stackTop.y) + 46;
+      wireLoop.setAttribute('d',
+        'M ' + resultBottom.x + ' ' + resultBottom.y +
+        ' C ' + resultBottom.x + ' ' + dipY + ', ' + stackTop.x + ' ' + dipY + ', ' + stackTop.x + ' ' + stackTop.y);
+    }
+    window.addEventListener('resize', () => requestAnimationFrame(updateWires));
+
+    function findHitCard(paraIdx, blockIdx){
+      return hitList.querySelector('.snipe-hit-card[data-para="' + paraIdx + '"][data-block-idx="' + blockIdx + '"]');
+    }
+
+    function setCardState(paraIdx, blockIdx, state, grade){
+      const card = findHitCard(paraIdx, blockIdx);
+      if (!card) return;
+      card.classList.remove('eliminated', 'champion');
+      if (state === 'eliminated') card.classList.add('eliminated');
+      else if (state === 'champion') card.classList.add('champion');
+      if (state === 'ranked'){
+        card.classList.add('ranked');
+        let badge = card.querySelector('.shc-grade');
+        if (!badge){
+          badge = document.createElement('div');
+          badge.className = 'shc-grade';
+          card.appendChild(badge);
+        }
+        badge.textContent = 'detail grade: ' + grade;
+      }
+    }
+
+    function addHitCard(paraIdx, blockIdx, context, sentence, category){
       if (hitEmpty){ hitEmpty.remove(); hitEmpty = null; }
       const cat = CAT_LABEL[category] ? category : 'aid';
       const card = document.createElement('div');
       card.className = 'snipe-hit-card cat-' + cat;
+      card.dataset.para = paraIdx;
+      card.dataset.blockIdx = blockIdx;
       card.innerHTML =
-        '<div class="shc-head"><span>' + svgEsc(context) + ' · ' + svgEsc(CAT_LABEL[cat]) + '</span><span>P' + (index+1) + '</span></div>' +
+        '<div class="shc-head"><span>' + svgEsc(context) + ' · ' + svgEsc(CAT_LABEL[cat]) + '</span><span>P' + (paraIdx+1) + '</span></div>' +
         '<div class="shc-text">' + svgEsc(sentence) + '</div>';
       hitList.appendChild(card);
       hitCount.textContent = '(' + hitList.querySelectorAll('.snipe-hit-card').length + ')';
@@ -1419,8 +1715,13 @@ INDEX_HTML = """<!DOCTYPE html>
           currentHighlights = [];
           paraText.textContent = evt.text; paraText.classList.remove('empty');
           paraMeta.textContent = 'paragraph ' + (evt.index+1) + ' / ' + evt.total + ' — splitting into sentences…';
+          blockHitLocalCount = 0;
           detailTop.innerHTML = '<span class="dtb-label">Most detailed sentence in this paragraph</span>' +
             '<span class="empty">Not enough highlighted sentences yet — appears once at least one is found and compared.</span>';
+          nodeRoundLabel.textContent = 'Waiting for this paragraph\\'s sentences to finish being highlighted…';
+          resetNodeGraph();
+          nodeFinal.innerHTML = '<span class="empty">Ranked sentences will be listed here, highest detail first, as each round finishes.</span>';
+          nodeFinalEmpty = nodeFinal.querySelector('.empty');
           break;
         }
         case 'sentence_check_start':
@@ -1436,18 +1737,79 @@ INDEX_HTML = """<!DOCTYPE html>
             ' — sentence ' + (evt.sent_index+1) + ' / ' + evt.sent_total + ' (' + evt.elapsed + 's)' +
             (cat ? ' — matched: ' + CAT_LABEL[cat] : ' — no match');
           if (cat){
-            addHitCard(evt.index, evt.context || '', evt.sentence, cat);
+            addHitCard(evt.index, blockHitLocalCount, evt.context || '', evt.sentence, cat);
+            blockHitLocalCount++;
           }
           break;
         }
-        case 'detail_compare_start':
-          paraMeta.textContent = 'paragraph ' + (evt.index+1) + ' / ' + evt.total +
-            ' — comparing detail: pair ' + (evt.pair_index+1) + ' / ' + evt.pair_total + '…';
+        case 'detail_round_start': {
+          // fresh round: un-gray everything from this paragraph that hasn't been graded yet
+          hitList.querySelectorAll('.snipe-hit-card[data-para="' + evt.index + '"]').forEach(card => {
+            if (!card.classList.contains('ranked')) card.classList.remove('eliminated', 'champion');
+          });
+          nodeRoundLabel.textContent = 'Round ' + (evt.round+1) + ' — ' + evt.pool.length + ' sentence(s) still in contention';
+          // the pool physically becomes the stack -- front card is the current pick
+          stackPool = (evt.pool || []).map(p => ({ idx: p.idx, sentence: p.sentence }));
+          renderStack();
+          if (stackPool.length) setCardState(evt.index, stackPool[0].idx, 'champion');
+          setResult('—', false);
+          clearWireStates();
+          nodeWhich.classList.remove('active');
           break;
-        case 'detail_compare_done':
-          paraMeta.textContent = 'paragraph ' + (evt.index+1) + ' / ' + evt.total +
-            ' — detail comparison ' + (evt.pair_index+1) + ' / ' + evt.pair_total + ' done (' + evt.elapsed + 's)';
+        }
+        case 'detail_bout_start':
+          // the top two cards in the stack feed into WHICH -- light up their wires
+          wireChamp.classList.add('live'); portChampOut.classList.add('live');
+          wireChall.classList.add('live'); portChallOut.classList.add('live');
+          setResult('…thinking…', false);
+          nodeWhich.classList.add('active');
           break;
+        case 'detail_bout_done': {
+          nodeWhich.classList.remove('active');
+          wireChamp.classList.remove('live'); portChampOut.classList.remove('live');
+          wireChall.classList.remove('live'); portChallOut.classList.remove('live');
+          const winnerSentence = (evt.winner_idx === evt.champion_idx) ? evt.sentence_a : evt.sentence_b;
+          wireResult.classList.add('win'); portWhichOut.classList.add('win');
+          setResult(winnerSentence, true);
+          setCardState(evt.index, evt.loser_idx, 'eliminated');
+          setCardState(evt.index, evt.winner_idx, 'champion');
+          // the loser physically leaves the stack; the winner slides back to the front as the new pick
+          const loserCard = nodeStackArea.querySelector('.stack-card[data-stack-idx="' +
+            (stackPool.findIndex(p => p.idx === evt.loser_idx)) + '"]');
+          if (loserCard) loserCard.classList.add('leaving');
+          const winnerEntry = stackPool.find(p => p.idx === evt.winner_idx);
+          stackPool = stackPool.filter(p => p.idx !== evt.loser_idx && p.idx !== evt.winner_idx);
+          if (winnerEntry) stackPool.unshift(winnerEntry);
+          setTimeout(() => {
+            renderStack();
+            wireResult.classList.remove('win'); portWhichOut.classList.remove('win');
+          }, 260);
+          // show the loop-back wire briefly -- the chosen sentence loops back into WHICH to face the next one
+          setTimeout(() => wireLoop.classList.add('show'), 280);
+          setTimeout(() => wireLoop.classList.remove('show'), 900);
+          break;
+        }
+        case 'detail_round_winner': {
+          setCardState(evt.index, evt.winner_idx, 'ranked', evt.grade);
+          if (nodeFinalEmpty){ nodeFinalEmpty.remove(); nodeFinalEmpty = null; }
+          const row = document.createElement('div');
+          row.className = 'nf-row';
+          row.innerHTML = '<span class="nf-grade">G' + evt.grade + '</span><span class="nf-text">' + svgEsc(evt.sentence) + '</span>';
+          nodeFinal.insertBefore(row, nodeFinal.firstChild);
+          // the round's champion leaves the stack for good -- it's ranked now
+          const wonCard = nodeStackArea.querySelector('.stack-card.pick');
+          if (wonCard) wonCard.classList.add('winning-out');
+          stackPool = stackPool.filter(p => p.idx !== evt.winner_idx);
+          setResult('—', false);
+          clearWireStates();
+          setTimeout(renderStack, 260);
+          if (evt.remaining_count > 0){
+            nodeRoundLabel.textContent = 'Round ' + (evt.round+1) + ' winner found — ' + evt.remaining_count + ' sentence(s) left to rank';
+          } else {
+            nodeRoundLabel.textContent = 'Ranking complete for this paragraph.';
+          }
+          break;
+        }
         case 'para_ranked': {
           (evt.ranked || []).forEach(r => {
             const hl = currentHighlights.find(h => h.start === r.start && h.end === r.end);
